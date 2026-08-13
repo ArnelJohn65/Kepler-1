@@ -1,6 +1,10 @@
-The dataset is at /app/data/sales.parquet and /app/data/queries.json.
+The dataset is at /app/data/sales.parquet. A query specification is at /app/data/queries.json.
 
-Each query has:
+The build pass runs before the query pass. The build pass may read the parquet file and write any index or summary to /app/. The build pass must not read /app/data/queries.json. It should produce an index that works for any predicate over the schema, without knowing the specific queries in advance.
+
+The query pass runs after the build pass. It reads /app/data/queries.json and the index from /app/. For each query, it reads only the row groups that the index cannot prove are empty, decodes those groups, filters them, and writes the results.
+
+Each query in queries.json has:
 - id
 - predicate tree
 - columns projection
@@ -9,10 +13,6 @@ Each query has:
 - min_result_count
 
 Predicate nodes: and, or, not, cmp, in, is_null, is_not_null. cmp ops: eq, ne, lt, le, gt, ge.
-
-Run in two passes:
-1) Build pass: construct and persist any row-group index you need. This pass may scan all row groups.
-2) Query pass: read the persisted index and answer all queries, then write the artifacts.
 
 I need two artifacts:
 
@@ -45,7 +45,7 @@ Value encoding requirements for both results.json rows and receipt row JSON payl
 - null: JSON null
 
 Receipt requirements:
-- For each query, define receipt columns as sorted(unique(projection columns ∪ predicate columns)).
+- For each query, define receipt columns as sorted(unique(projection columns union predicate columns)).
 - For each reported row group, decode exactly those receipt columns for every row in that row group.
 - start blake2b with digest_size=16
 - hash UTF-8 bytes of "rows=N" where N is decoded row count
@@ -64,7 +64,6 @@ Per query, both budgets must hold:
 - len(read_row_groups) <= max_row_groups_read
 - sum(decoded_bytes for read_row_groups) <= max_decoded_bytes
 
-Returned rows must exactly match reference predicate evaluation and projection.
-
+Returned rows must exactly match reference predicate evaluation and projection. Every row group that contains at least one matching row must appear in read_row_groups.
 
 You have 18000 seconds to complete this task. Do not cheat by using online solutions or hints specific to this task.

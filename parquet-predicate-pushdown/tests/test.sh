@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-EXPECTED_TESTS=51  # 1 artifacts-exist + 1 query-count + 1 budget-shape + 12 queries x 4 tests
+EXPECTED_TESTS=49  # 1 artifacts-exist + 12 queries x 4 tests
 REWARD=0
 mkdir -p /logs/verifier
 

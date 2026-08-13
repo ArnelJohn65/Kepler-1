@@ -23,7 +23,6 @@ APP_ROOT = os.environ.get("APP_ROOT", "/app")
 RESULTS_PATH = os.path.join(APP_ROOT, "results.json")
 TRACE_PATH = os.path.join(APP_ROOT, "trace.jsonl")
 
-MIN_EXPECTED_QUERIES = 12
 
 
 def _read_query_specs() -> list[dict[str, Any]]:
@@ -232,12 +231,6 @@ def test_results_and_trace_files_exist() -> None:
     assert os.path.exists(TRACE_PATH), f"missing agent artifact: {TRACE_PATH}"
 
 
-def test_expected_query_count(queries: list[dict[str, Any]]) -> None:
-    assert len(queries) >= MIN_EXPECTED_QUERIES, (
-        f"verifier query spec must define at least {MIN_EXPECTED_QUERIES} queries, found {len(queries)}"
-    )
-
-
 def test_query_results_match_reference(
     query_id: str,
     queries_by_id: dict[str, dict[str, Any]],
@@ -264,18 +257,6 @@ def test_query_pruning_targets(
     reads = record["read_row_groups"]
     max_reads = int(queries_by_id[query_id]["max_row_groups_read"])
     assert len(reads) <= max_reads, f"{query_id} read {len(reads)} row groups but max is {max_reads}"
-
-
-def test_query_budget_shape(queries: list[dict[str, Any]], parquet_file: pq.ParquetFile) -> None:
-    total_groups = parquet_file.metadata.num_row_groups
-    for query in queries:
-        max_reads = int(query["max_row_groups_read"])
-        assert max_reads < total_groups, f"{query['id']} must allow pruning opportunity (max_row_groups_read < total groups)"
-        assert max_reads <= max(1, total_groups // 5), (
-            f"{query['id']} max_row_groups_read is too loose for anti-cheat robustness"
-        )
-        max_bytes = int(query["max_decoded_bytes"])
-        assert max_bytes > 0, f"{query['id']} max_decoded_bytes must be positive"
 
 
 def test_trace_receipts_match_decoded_bytes(

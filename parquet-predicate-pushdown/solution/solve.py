@@ -18,7 +18,7 @@ APP_ROOT = os.environ.get("APP_ROOT", "/app")
 DATA_DIR = os.path.join(APP_ROOT, "data")
 RESULTS_PATH = os.path.join(APP_ROOT, "results.json")
 TRACE_PATH = os.path.join(APP_ROOT, "trace.jsonl")
-INDEX_PATH = os.path.join(DATA_DIR, "row_group_index.pkl")
+INDEX_PATH = os.path.join(APP_ROOT, "row_group_index.pkl")
 METRICS_PATH = os.path.join(APP_ROOT, "query_metrics.json")
 
 PAIR_INDEX_COLUMNS = [("segment", "status"), ("region", "channel"), ("sku", "event_day")]
@@ -418,16 +418,21 @@ def _query_receipt(query_id: str, read_row_groups: list[dict[str, Any]]) -> str:
     return h.hexdigest()
 
 
-def build_index() -> None:
-    queries = _load_queries()
-    if not queries:
-        raise RuntimeError("No queries available")
+def _find_parquet() -> str:
+    import glob as _glob
+    matches = _glob.glob(os.path.join(DATA_DIR, "*.parquet"))
+    if not matches:
+        raise RuntimeError(f"No parquet file found in {DATA_DIR}")
+    return sorted(matches)[0]
 
-    pf = pq.ParquetFile(os.path.join(DATA_DIR, queries[0]["file"]))
+
+def build_index() -> None:
+    parquet_path = _find_parquet()
+    pf = pq.ParquetFile(parquet_path)
     rg_index = _build_row_group_index(pf)
 
     with open(INDEX_PATH, "wb") as f:
-        pickle.dump({"num_row_groups": pf.metadata.num_row_groups, "index": rg_index}, f)
+        pickle.dump({"parquet": os.path.basename(parquet_path), "num_row_groups": pf.metadata.num_row_groups, "index": rg_index}, f)
 
     print(f"Wrote {INDEX_PATH}")
 
@@ -440,10 +445,10 @@ def run_query_pass() -> None:
     if not queries:
         raise RuntimeError("No queries available")
 
-    pf = pq.ParquetFile(os.path.join(DATA_DIR, queries[0]["file"]))
     with open(INDEX_PATH, "rb") as f:
         payload = pickle.load(f)
     rg_index: list[RowGroupIndex] = payload["index"]
+    pf = pq.ParquetFile(os.path.join(DATA_DIR, payload["parquet"]))
 
     results_payload: list[dict[str, Any]] = []
     trace_records: list[dict[str, Any]] = []

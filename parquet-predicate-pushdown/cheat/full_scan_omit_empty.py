@@ -1,15 +1,13 @@
 """
-Shortcut: full scan, genuine receipts, but only reports row groups that
-contained at least one matching row.
+Cheat attempt: full scan with honest reporting of all decoded row groups.
+Fails on both max_row_groups_read and max_decoded_bytes verifier checks.
 """
 import hashlib
 import json
 import math
 import os
-import sys
 from datetime import UTC, datetime
 from decimal import Decimal
-from time import perf_counter
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -19,7 +17,6 @@ APP_ROOT = os.environ.get("APP_ROOT", "/app")
 DATA_DIR = os.path.join(APP_ROOT, "data")
 RESULTS_PATH = os.path.join(APP_ROOT, "results.json")
 TRACE_PATH = os.path.join(APP_ROOT, "trace.jsonl")
-QUERY_TIMEOUT_SEC = float(os.environ.get("QUERY_TIMEOUT_SEC", "1.6"))
 
 
 def _normalize(v):
@@ -121,7 +118,6 @@ def _query_receipt(query_id, read_row_groups):
 
 
 def main():
-    started = perf_counter()
     with open(os.path.join(DATA_DIR, "queries.json"), encoding="utf-8") as f:
         queries = json.load(f)
     pf = pq.ParquetFile(os.path.join(DATA_DIR, queries[0]["file"]))
@@ -138,15 +134,7 @@ def main():
         rows = []
         read_trace = []
         for rg in range(pf.metadata.num_row_groups):
-            # This internal check mirrors the runner's hard timeout and intentionally
-            # aborts before artifact emission when the query-phase budget is missed.
-            if perf_counter() - started > QUERY_TIMEOUT_SEC:
-                sys.exit(124)
             decoded = pf.read_row_group(rg, columns=read_cols)
-            filtered = _apply(decoded, predicate)
-            matching_rows = filtered.select(proj).to_pylist()
-            if not matching_rows:
-                continue
             receipt = _receipt(decoded)
             read_trace.append({
                 "row_group": rg,
@@ -154,7 +142,8 @@ def main():
                 "decoded_bytes": decoded.nbytes,
                 "receipt": receipt,
             })
-            rows.extend({k: _normalize(v) for k, v in row.items()} for row in matching_rows)
+            filtered = _apply(decoded, predicate)
+            rows.extend({k: _normalize(v) for k, v in row.items()} for row in filtered.select(proj).to_pylist())
 
         all_results.append({"query_id": q["id"], "rows": rows})
         all_traces.append({
@@ -163,11 +152,7 @@ def main():
             "query_receipt": _query_receipt(q["id"], read_trace),
             "result_count": len(rows),
         })
-        if perf_counter() - started > QUERY_TIMEOUT_SEC:
-            sys.exit(124)
 
-    if perf_counter() - started > QUERY_TIMEOUT_SEC:
-        sys.exit(124)
     with open(RESULTS_PATH, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2)
     with open(TRACE_PATH, "w", encoding="utf-8") as f:
