@@ -1,0 +1,18 @@
+artifacts = ["/app/results.json", "/app/trace.jsonl"]
+
+[task]
+name = "parquet-predicate-pushdown"
+version = "1.0.0"
+category = "Software"
+labels = ["query-engine", "parquet", "columnar", "predicate-pushdown", "python"]
+
+[agent]
+timeout_sec = 1800
+
+[metadata]
+author_name = "Arnel John Mengote"
+author_email = "arneljohn65@outlook.com"
+relevant_experience = "I've spent 13 years building and debugging data pipelines across Redshift, BigQuery, Snowflake, Spark, and Databricks, which means I've read a lot of query plans and chased a lot of wrong-results bugs. At Qantas I migrated airline booking, fare, CRM and operational datasets from Redshift to BigQuery with parallel-run validation, so I know what it takes to prove that a rewritten engine returns identical numbers. At Insurity and UHS I built dbt star schemas and SCD2 marts on Snowflake and Databricks where null handling and boundary conditions in predicate pushdown were the exact class of bugs that caused silent data loss. That background makes it straightforward for me to judge whether a row-group pruning implementation is actually correct or just passes easy cases."
+task_explanation = "The task requires candidates to implement predicate pushdown and row-group pruning in a small query engine. The engine is intentionally broken: it reads every row group regardless of predicates, and the min/max statistics writer has an off-by-one bug on boundary values. Candidates must fix the statistics bug and implement pruning in the planner, while handling nulls correctly so that IS NULL and negated predicates are not incorrectly pruned."
+difficulty_explanation = "This sits beyond current frontier model ability because it combines three problems that each look simple alone: finding and fixing a subtle off-by-one in statistics collection, implementing correct min/max interval arithmetic for predicate pruning, and handling nulls without over-pruning. Getting any one wrong produces incorrect results that pass naive tests but fail on boundary and null cases."
+verification_explanation = "The verifier checks results.json for query-result correctness against a sealed ground truth and checks trace.jsonl to confirm that pruning actually happened — i.e. that queries with selective predicates read fewer row groups than the total. A solution that reads all row groups and gets correct results scores 0."
