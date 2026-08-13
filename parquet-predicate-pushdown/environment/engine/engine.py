@@ -1,6 +1,18 @@
-import hashlib
+"""
+Baseline query engine — full scan only.
+
+Load queries from /app/data/queries.json, scan every row group in
+the referenced Parquet file, apply the predicate, and write results
+to /app/results.json.
+
+You need to:
+  1. Write /app/trace.jsonl (one JSON object per line, one per query).
+  2. Add row-group pruning so that each query reads at most
+     max_row_groups_read row groups.
+  3. Emit correct receipts in the trace so the verifier can validate them.
+"""
+
 import json
-import math
 import os
 from typing import Any
 
@@ -11,8 +23,6 @@ import pyarrow.parquet as pq
 APP_ROOT = os.environ.get("APP_ROOT", "/app")
 DATA_DIR = os.path.join(APP_ROOT, "data")
 RESULTS_PATH = os.path.join(APP_ROOT, "results.json")
-TRACE_PATH = os.path.join(APP_ROOT, "trace.jsonl")
-INDEX_PATH = os.path.join(DATA_DIR, "row_group_index.json")
 
 
 def _load_queries() -> list[dict[str, Any]]:
@@ -20,268 +30,90 @@ def _load_queries() -> list[dict[str, Any]]:
         return json.load(f)
 
 
-def _load_index() -> dict[int, dict[str, Any]]:
-    with open(INDEX_PATH, encoding="utf-8") as f:
-        entries = json.load(f)
-    return {int(entry["row_group"]): entry for entry in entries}
-
-
-def _columns_in_predicate(node: dict[str, Any] | None, output: set[str]) -> None:
-    if not node:
-        return
-    node_type = node["type"]
-    if node_type in {"cmp", "in", "is_null", "is_not_null"}:
-        output.add(node["column"])
-        return
-    if node_type in {"and", "or"}:
-        for child in node["children"]:
-            _columns_in_predicate(child, output)
-        return
-    if node_type == "not":
-        _columns_in_predicate(node["child"], output)
-        return
-    raise ValueError(f"Unsupported predicate node type: {node_type}")
-
-
 def _build_mask(table: pa.Table, node: dict[str, Any]) -> pa.Array:
-    node_type = node["type"]
-
-    if node_type == "cmp":
+    t = node["type"]
+    if t == "cmp":
         col = table.column(node["column"])
         op = node["op"]
-        value = node["value"]
-        if op == "eq":
-            return pc.equal(col, value)
-        if op == "ne":
-            return pc.not_equal(col, value)
-        if op == "lt":
-            return pc.less(col, value)
-        if op == "le":
-            return pc.less_equal(col, value)
-        if op == "gt":
-            return pc.greater(col, value)
-        if op == "ge":
-            return pc.greater_equal(col, value)
-        raise ValueError(f"Unsupported cmp op: {op}")
-
-    if node_type == "in":
+        val = node["value"]
+        ops = {
+            "eq": pc.equal, "ne": pc.not_equal,
+            "lt": pc.less, "le": pc.less_equal,
+            "gt": pc.greater, "ge": pc.greater_equal,
+        }
+        return ops[op](col, val)
+    if t == "in":
         col = table.column(node["column"])
-        values = pa.array(node["values"], type=col.type)
-        return pc.is_in(col, value_set=values)
-
-    if node_type == "is_null":
+        return pc.is_in(col, value_set=pa.array(node["values"], type=col.type))
+    if t == "is_null":
         return pc.is_null(table.column(node["column"]))
-
-    if node_type == "is_not_null":
+    if t == "is_not_null":
         return pc.is_valid(table.column(node["column"]))
-
-    if node_type == "and":
-        masks = [_build_mask(table, child) for child in node["children"]]
-        mask = masks[0]
-        for other in masks[1:]:
-            mask = pc.and_(mask, other)
-        return mask
-
-    if node_type == "or":
-        masks = [_build_mask(table, child) for child in node["children"]]
-        mask = masks[0]
-        for other in masks[1:]:
-            mask = pc.or_(mask, other)
-        return mask
-
-    if node_type == "not":
+    if t == "and":
+        masks = [_build_mask(table, c) for c in node["children"]]
+        out = masks[0]
+        for m in masks[1:]:
+            out = pc.and_(out, m)
+        return out
+    if t == "or":
+        masks = [_build_mask(table, c) for c in node["children"]]
+        out = masks[0]
+        for m in masks[1:]:
+            out = pc.or_(out, m)
+        return out
+    if t == "not":
         return pc.invert(_build_mask(table, node["child"]))
-
-    raise ValueError(f"Unsupported predicate node type: {node_type}")
+    raise ValueError(f"unknown predicate type: {t}")
 
 
 def _apply_predicate(table: pa.Table, predicate: dict[str, Any] | None) -> pa.Table:
     if predicate is None:
         return table
-    mask = _build_mask(table, predicate)
-    return table.filter(mask)
+    return table.filter(_build_mask(table, predicate))
 
 
-def _extract_stats(rg_meta: pq.RowGroupMetaData, column_name: str) -> dict[str, Any]:
-    for col_idx in range(rg_meta.num_columns):
-        cmeta = rg_meta.column(col_idx)
-        if cmeta.path_in_schema != column_name:
-            continue
-        stats = cmeta.statistics
-        if stats is None:
-            return {"min": None, "max": None, "null_count": None, "num_rows": rg_meta.num_rows}
-        return {
-            "min": stats.min if stats.has_min_max else None,
-            "max": stats.max if stats.has_min_max else None,
-            "null_count": stats.null_count,
-            "num_rows": rg_meta.num_rows,
-        }
-    return {"min": None, "max": None, "null_count": None, "num_rows": rg_meta.num_rows}
+def _columns_in_predicate(node: dict[str, Any] | None, out: set[str]) -> None:
+    if node is None:
+        return
+    t = node["type"]
+    if t in {"cmp", "in", "is_null", "is_not_null"}:
+        out.add(node["column"])
+    elif t in {"and", "or"}:
+        for c in node["children"]:
+            _columns_in_predicate(c, out)
+    elif t == "not":
+        _columns_in_predicate(node["child"], out)
 
 
-def _normalize(v: Any) -> Any:
-    if isinstance(v, float) and math.isnan(v):
-        return "NaN"
-    return v
-
-
-def _receipt_for_table(table: pa.Table) -> str:
-    h = hashlib.blake2b(digest_size=16)
-    h.update(f"rows={table.num_rows}".encode("utf-8"))
-    for row in table.to_pylist():
-        payload = json.dumps({k: _normalize(v) for k, v in row.items()}, sort_keys=True, separators=(",", ":"))
-        h.update(payload.encode("utf-8"))
-        h.update(b"\n")
-    return h.hexdigest()
-
-
-def _cmp_may_match(stats: dict[str, Any], op: str, value: Any) -> bool:
-    rg_min = stats["min"]
-    rg_max = stats["max"]
-    if rg_min is None or rg_max is None:
-        return True
-    if op == "eq":
-        return not (value < rg_min or value > rg_max)
-    if op == "ne":
-        return True
-    if op == "lt":
-        return rg_min < value
-    if op == "le":
-        return rg_min <= value
-    if op == "gt":
-        return rg_max > value
-    if op == "ge":
-        return rg_max >= value
-    return True
-
-
-def _may_match(node: dict[str, Any], rg_meta: pq.RowGroupMetaData, index_entry: dict[str, Any]) -> bool:
-    node_type = node["type"]
-
-    if node_type == "cmp":
-        stats = _extract_stats(rg_meta, node["column"])
-        return _cmp_may_match(stats, node["op"], node["value"])
-
-    if node_type == "in":
-        stats = _extract_stats(rg_meta, node["column"])
-        if stats.get("null_count") is not None and stats["null_count"] >= stats["num_rows"]:
-            return False
-        indexed_values = set(index_entry.get("values", {}).get(node["column"], []))
-        if indexed_values:
-            return not indexed_values.isdisjoint(set(node["values"]))
-        return True
-
-    if node_type == "is_null":
-        stats = _extract_stats(rg_meta, node["column"])
-        null_count = stats.get("null_count")
-        if null_count == 0:
-            return False
-        return True
-
-    if node_type == "is_not_null":
-        stats = _extract_stats(rg_meta, node["column"])
-        null_count = stats.get("null_count")
-        num_rows = stats.get("num_rows")
-        if null_count is not None and num_rows is not None and null_count >= num_rows:
-            return False
-        return True
-
-    if node_type == "and":
-        for child in node["children"]:
-            if not _may_match(child, rg_meta, index_entry):
-                return False
-        return True
-
-    if node_type == "or":
-        return any(_may_match(child, rg_meta, index_entry) for child in node["children"])
-
-    if node_type == "not":
-        return True
-
-    return True
-
-
-def _query_receipt(query_id: str, read_row_groups: list[dict[str, Any]]) -> str:
-    h = hashlib.blake2b(digest_size=16)
-    h.update(query_id.encode("utf-8"))
-    h.update(b"|")
-    for entry in read_row_groups:
-        h.update(f"{entry['row_group']}:{entry['decoded_rows']}:{entry['receipt']}".encode("utf-8"))
-        h.update(b"|")
-    return h.hexdigest()
-
-
-def run_query(pf: pq.ParquetFile, query: dict[str, Any], index_by_rg: dict[int, dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def run_query(pf: pq.ParquetFile, query: dict[str, Any]) -> list[dict[str, Any]]:
     predicate = query.get("predicate")
-    projection = query.get("columns", [])
+    projection = query["columns"]
+    required = set(projection)
+    _columns_in_predicate(predicate, required)
+    read_columns = sorted(required)
 
-    required_columns = set(projection)
-    _columns_in_predicate(predicate, required_columns)
-    read_columns = sorted(required_columns)
-
-    results: list[dict[str, Any]] = []
-    read_trace: list[dict[str, Any]] = []
-
+    rows: list[dict[str, Any]] = []
     for rg_idx in range(pf.metadata.num_row_groups):
-        rg_meta = pf.metadata.row_group(rg_idx)
-        index_entry = index_by_rg.get(rg_idx, {})
-
-        if predicate is not None and not _may_match(predicate, rg_meta, index_entry):
-            continue
-
         decoded = pf.read_row_group(rg_idx, columns=read_columns)
-        receipt = _receipt_for_table(decoded)
-
         filtered = _apply_predicate(decoded, predicate)
-        if projection:
-            filtered = filtered.select(projection)
-
-        read_trace.append(
-            {
-                "row_group": rg_idx,
-                "decoded_rows": decoded.num_rows,
-                "receipt": receipt,
-            }
-        )
-
-        for row in filtered.to_pylist():
-            results.append({k: _normalize(v) for k, v in row.items()})
-
-    trace_record = {
-        "query_id": query["id"],
-        "read_row_groups": read_trace,
-        "query_receipt": _query_receipt(query["id"], read_trace),
-        "result_count": len(results),
-    }
-    return results, trace_record
+        rows.extend(filtered.select(projection).to_pylist())
+    return rows
 
 
 def main() -> None:
     queries = _load_queries()
-    index_by_rg = _load_index()
-
-    if not queries:
-        raise RuntimeError("No queries found")
-
-    parquet_file = os.path.join(DATA_DIR, queries[0]["file"])
-    pf = pq.ParquetFile(parquet_file)
+    pf = pq.ParquetFile(os.path.join(DATA_DIR, queries[0]["file"]))
 
     all_results: list[dict[str, Any]] = []
-    trace_records: list[dict[str, Any]] = []
-
     for query in queries:
-        rows, trace = run_query(pf, query, index_by_rg)
+        rows = run_query(pf, query)
         all_results.append({"query_id": query["id"], "rows": rows})
-        trace_records.append(trace)
 
     with open(RESULTS_PATH, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2)
 
-    with open(TRACE_PATH, "w", encoding="utf-8") as f:
-        for record in trace_records:
-            f.write(json.dumps(record) + "\n")
-
-    print(f"Wrote {RESULTS_PATH} and {TRACE_PATH}")
+    print(f"Wrote {RESULTS_PATH}")
+    print("WARNING: trace.jsonl not written — you must implement it")
 
 
 if __name__ == "__main__":
