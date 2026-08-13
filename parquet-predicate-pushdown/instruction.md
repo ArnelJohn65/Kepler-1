@@ -14,7 +14,7 @@ Run in two passes:
 1) Build pass: construct and persist any row-group index you need. This pass may scan all row groups.
 2) Query pass: read the persisted index and answer all queries, then write the artifacts.
 
-The query pass is time-budgeted by the runner. A full-scan query pass is expected to miss budget.
+I will give the query pass about 1.6 seconds in the runner. A full-scan query pass is expected to miss that budget.
 
 I need two artifacts:
 
