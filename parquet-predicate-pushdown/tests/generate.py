@@ -3,8 +3,10 @@ import os
 import random
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 TESTS_ROOT = os.environ.get("TESTS_ROOT", "/tests")
@@ -13,7 +15,7 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 RANDOM_SEED = 20260813
 ROW_GROUPS = 192
-ROWS_PER_GROUP = 640
+ROWS_PER_GROUP = 1024
 
 regions = ["APAC", "EMEA", "AMER"]
 segments = ["retail", "enterprise", "public", "startup", "midmarket", "gov"]
@@ -119,7 +121,89 @@ def make_row_group(group_idx: int) -> pa.Table:
     )
 
 
-def build_queries() -> list[dict]:
+def _coerce_scalar(value: Any, dtype: pa.DataType) -> Any:
+    if pa.types.is_decimal(dtype):
+        return Decimal(str(value))
+    if pa.types.is_timestamp(dtype) and isinstance(value, str):
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return value
+
+
+def _build_mask(table: pa.Table, node: dict[str, Any]) -> pa.Array:
+    t = node["type"]
+    if t == "cmp":
+        col = table.column(node["column"])
+        op = node["op"]
+        value = _coerce_scalar(node["value"], col.type)
+        if op == "eq":
+            return pc.equal(col, value)
+        if op == "ne":
+            return pc.not_equal(col, value)
+        if op == "lt":
+            return pc.less(col, value)
+        if op == "le":
+            return pc.less_equal(col, value)
+        if op == "gt":
+            return pc.greater(col, value)
+        if op == "ge":
+            return pc.greater_equal(col, value)
+        raise AssertionError(f"unsupported cmp op in query spec: {op}")
+
+    if t == "in":
+        col = table.column(node["column"])
+        coerced = [_coerce_scalar(v, col.type) for v in node["values"]]
+        return pc.is_in(col, value_set=pa.array(coerced, type=col.type))
+
+    if t == "is_null":
+        return pc.is_null(table.column(node["column"]))
+
+    if t == "is_not_null":
+        return pc.is_valid(table.column(node["column"]))
+
+    if t == "and":
+        masks = [_build_mask(table, child) for child in node["children"]]
+        out = masks[0]
+        for mask in masks[1:]:
+            out = pc.and_(out, mask)
+        return out
+
+    if t == "or":
+        masks = [_build_mask(table, child) for child in node["children"]]
+        out = masks[0]
+        for mask in masks[1:]:
+            out = pc.or_(out, mask)
+        return out
+
+    if t == "not":
+        return pc.invert(_build_mask(table, node["child"]))
+
+    raise AssertionError(f"unsupported node type in query spec: {t}")
+
+
+def _apply_predicate(table: pa.Table, predicate: dict[str, Any] | None) -> pa.Table:
+    if predicate is None:
+        return table
+    return table.filter(_build_mask(table, predicate))
+
+
+def _columns_in_predicate(node: dict[str, Any] | None, output: set[str]) -> None:
+    if node is None:
+        return
+    node_type = node["type"]
+    if node_type in {"cmp", "in", "is_null", "is_not_null"}:
+        output.add(node["column"])
+        return
+    if node_type in {"and", "or"}:
+        for child in node["children"]:
+            _columns_in_predicate(child, output)
+        return
+    if node_type == "not":
+        _columns_in_predicate(node["child"], output)
+        return
+    raise AssertionError(f"unknown predicate node type in query spec: {node_type}")
+
+
+def build_queries() -> list[dict[str, Any]]:
     return [
         {
             "id": "q1",
@@ -134,7 +218,7 @@ def build_queries() -> list[dict]:
                     {"type": "cmp", "column": "status", "op": "eq", "value": "hold"},
                 ],
             },
-            "max_row_groups_read": 9,
+            "budget_slack": 2,
             "min_result_count": 1,
         },
         {
@@ -150,50 +234,38 @@ def build_queries() -> list[dict]:
                     {"type": "cmp", "column": "status", "op": "eq", "value": "pending"},
                 ],
             },
-            "max_row_groups_read": 8,
+            "budget_slack": 2,
             "min_result_count": 1,
         },
         {
             "id": "q3",
             "file": "sales.parquet",
-            "columns": ["id", "channel", "priority", "amount"],
+            "columns": ["id", "event_day", "region", "status", "event_ts"],
             "predicate": {
                 "type": "and",
                 "children": [
-                    {
-                        "type": "not",
-                        "child": {
-                            "type": "or",
-                            "children": [
-                                {"type": "in", "column": "channel", "values": ["web", "partner"]},
-                                {"type": "in", "column": "priority", "values": [1, 2]},
-                            ],
-                        },
-                    },
-                    {"type": "cmp", "column": "amount", "op": "gt", "value": 500.0},
+                    {"type": "cmp", "column": "event_day", "op": "eq", "value": 19507},
+                    {"type": "cmp", "column": "region", "op": "eq", "value": "EMEA"},
+                    {"type": "cmp", "column": "status", "op": "eq", "value": "closed"},
                 ],
             },
-            "max_row_groups_read": 128,
+            "budget_slack": 2,
             "min_result_count": 1,
         },
         {
             "id": "q4",
             "file": "sales.parquet",
-            "columns": ["id", "priority", "region", "segment"],
+            "columns": ["id", "priority", "region", "segment", "amount"],
             "predicate": {
                 "type": "and",
                 "children": [
                     {"type": "is_null", "column": "priority"},
-                    {
-                        "type": "or",
-                        "children": [
-                            {"type": "cmp", "column": "region", "op": "eq", "value": "AMER"},
-                            {"type": "cmp", "column": "segment", "op": "eq", "value": "public"},
-                        ],
-                    },
+                    {"type": "cmp", "column": "segment", "op": "eq", "value": "gov"},
+                    {"type": "cmp", "column": "amount", "op": "ge", "value": 330.0},
+                    {"type": "cmp", "column": "amount", "op": "lt", "value": 470.0},
                 ],
             },
-            "max_row_groups_read": 96,
+            "budget_slack": 3,
             "min_result_count": 1,
         },
         {
@@ -217,43 +289,39 @@ def build_queries() -> list[dict]:
                     {"type": "in", "column": "sku", "values": ["SKU010", "SKU011", "SKU012"]},
                 ],
             },
-            "max_row_groups_read": 6,
+            "budget_slack": 2,
             "min_result_count": 1,
         },
         {
             "id": "q6",
             "file": "sales.parquet",
-            "columns": ["id", "event_day", "status", "event_ts"],
+            "columns": ["id", "event_day", "status", "region", "event_ts"],
             "predicate": {
                 "type": "and",
                 "children": [
                     {"type": "cmp", "column": "event_day", "op": "ge", "value": 19518},
                     {"type": "cmp", "column": "event_day", "op": "le", "value": 19519},
                     {"type": "in", "column": "status", "values": ["hold", "pending"]},
+                    {"type": "cmp", "column": "region", "op": "eq", "value": "EMEA"},
                 ],
             },
-            "max_row_groups_read": 14,
+            "budget_slack": 2,
             "min_result_count": 1,
         },
         {
             "id": "q7",
             "file": "sales.parquet",
-            "columns": ["id", "region", "priority", "amount"],
+            "columns": ["id", "region", "segment", "priority", "amount"],
             "predicate": {
                 "type": "and",
                 "children": [
                     {"type": "not", "child": {"type": "in", "column": "region", "values": ["APAC"]}},
-                    {
-                        "type": "or",
-                        "children": [
-                            {"type": "in", "column": "priority", "values": [1, 2]},
-                            {"type": "is_null", "column": "priority"},
-                        ],
-                    },
+                    {"type": "in", "column": "priority", "values": [1, 2]},
                     {"type": "cmp", "column": "amount", "op": "gt", "value": 900.0},
+                    {"type": "cmp", "column": "segment", "op": "eq", "value": "enterprise"},
                 ],
             },
-            "max_row_groups_read": 48,
+            "budget_slack": 3,
             "min_result_count": 1,
         },
         {
@@ -268,7 +336,7 @@ def build_queries() -> list[dict]:
                     {"type": "cmp", "column": "amount_dec", "op": "le", "value": "1080.00"},
                 ],
             },
-            "max_row_groups_read": 22,
+            "budget_slack": 4,
             "min_result_count": 1,
         },
         {
@@ -285,65 +353,89 @@ def build_queries() -> list[dict]:
                     {"type": "cmp", "column": "amount", "op": "lt", "value": 360.0},
                 ],
             },
-            "max_row_groups_read": 12,
+            "budget_slack": 2,
             "min_result_count": 1,
         },
         {
             "id": "q10",
             "file": "sales.parquet",
-            "columns": ["id", "region", "channel", "priority", "status"],
+            "columns": ["id", "region", "segment", "status"],
             "predicate": {
                 "type": "and",
                 "children": [
                     {"type": "cmp", "column": "region", "op": "eq", "value": "EMEA"},
-                    {
-                        "type": "not",
-                        "child": {
-                            "type": "or",
-                            "children": [
-                                {"type": "in", "column": "channel", "values": ["mobile"]},
-                                {"type": "in", "column": "status", "values": ["fraud"]},
-                                {"type": "in", "column": "priority", "values": [3, 4]},
-                            ],
-                        },
-                    },
+                    {"type": "cmp", "column": "status", "op": "eq", "value": "fraud"},
+                    {"type": "cmp", "column": "segment", "op": "eq", "value": "enterprise"},
                 ],
             },
-            "max_row_groups_read": 64,
+            "budget_slack": 2,
             "min_result_count": 1,
         },
         {
             "id": "q11",
             "file": "sales.parquet",
-            "columns": ["id", "amount", "region"],
+            "columns": ["id", "amount", "region", "sku", "event_day"],
             "predicate": {
                 "type": "and",
                 "children": [
+                    {"type": "cmp", "column": "sku", "op": "eq", "value": "SKU001"},
+                    {"type": "cmp", "column": "event_day", "op": "eq", "value": 19500},
                     {"type": "cmp", "column": "amount", "op": "ge", "value": 0.0},
-                    {"type": "cmp", "column": "amount", "op": "lt", "value": 2000.0},
+                    {"type": "cmp", "column": "amount", "op": "lt", "value": 150.0},
                 ],
             },
-            "max_row_groups_read": ROW_GROUPS,
+            "budget_slack": 2,
             "min_result_count": 1,
         },
         {
             "id": "q12",
             "file": "sales.parquet",
-            "columns": ["id", "score", "amount"],
+            "columns": ["id", "score", "amount", "status"],
             "predicate": {
-                "type": "not",
-                "child": {
-                    "type": "or",
-                    "children": [
-                        {"type": "cmp", "column": "score", "op": "lt", "value": 0.0},
-                        {"type": "cmp", "column": "score", "op": "ge", "value": 0.0},
-                    ],
-                },
+                "type": "and",
+                "children": [
+                    {"type": "is_null", "column": "score"},
+                    {"type": "cmp", "column": "status", "op": "eq", "value": "hold"},
+                    {"type": "cmp", "column": "amount", "op": "lt", "value": 100.0},
+                ],
             },
-            "max_row_groups_read": ROW_GROUPS,
+            "budget_slack": 2,
             "min_result_count": 1,
         },
     ]
+
+
+def finalize_query_budgets(parquet_path: str, queries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    pf = pq.ParquetFile(parquet_path)
+    total_row_groups = pf.metadata.num_row_groups
+
+    for query in queries:
+        predicate = query.get("predicate")
+        projection = query["columns"]
+
+        required = set(projection)
+        _columns_in_predicate(predicate, required)
+        read_columns = sorted(required)
+
+        matching_groups = 0
+        all_group_bytes: list[int] = []
+
+        for rg_idx in range(total_row_groups):
+            decoded = pf.read_row_group(rg_idx, columns=read_columns)
+            all_group_bytes.append(decoded.nbytes)
+            if _apply_predicate(decoded, predicate).num_rows > 0:
+                matching_groups += 1
+
+        assert matching_groups > 0, f"{query['id']} must have at least one matching row group"
+
+        max_reads = matching_groups + int(query.pop("budget_slack"))
+        assert max_reads < total_row_groups, f"{query['id']} max_row_groups_read must be less than total row groups"
+        assert max_reads <= max(1, total_row_groups // 5), f"{query['id']} max_row_groups_read is too loose"
+
+        query["max_row_groups_read"] = max_reads
+        query["max_decoded_bytes"] = sum(sorted(all_group_bytes, reverse=True)[:max_reads])
+
+    return queries
 
 
 def main() -> None:
@@ -376,7 +468,7 @@ def main() -> None:
         if writer is not None:
             writer.close()
 
-    queries = build_queries()
+    queries = finalize_query_budgets(parquet_path, build_queries())
     with open(queries_path, "w", encoding="utf-8") as f:
         json.dump(queries, f, indent=2)
 

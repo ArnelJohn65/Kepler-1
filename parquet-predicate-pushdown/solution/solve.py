@@ -2,9 +2,12 @@ import hashlib
 import json
 import math
 import os
+import pickle
+import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
+from time import perf_counter
 from typing import Any
 
 import pyarrow as pa
@@ -15,6 +18,8 @@ APP_ROOT = os.environ.get("APP_ROOT", "/app")
 DATA_DIR = os.path.join(APP_ROOT, "data")
 RESULTS_PATH = os.path.join(APP_ROOT, "results.json")
 TRACE_PATH = os.path.join(APP_ROOT, "trace.jsonl")
+INDEX_PATH = os.path.join(DATA_DIR, "row_group_index.pkl")
+METRICS_PATH = os.path.join(APP_ROOT, "query_metrics.json")
 
 PAIR_INDEX_COLUMNS = [("segment", "status"), ("region", "channel"), ("sku", "event_day")]
 
@@ -42,7 +47,7 @@ def _normalize(v: Any) -> Any:
     if isinstance(v, Decimal):
         return format(v, "f")
     if isinstance(v, datetime):
-        return v.isoformat().replace("+00:00", "Z")
+        return v.astimezone(UTC).isoformat().replace("+00:00", "Z")
     return v
 
 
@@ -209,9 +214,8 @@ def _cmp_may_true(rg: RowGroupIndex, column: str, op: str, value: Any) -> bool:
     cv = rg.values.get(column)
     has_nan = rg.has_nan.get(column, False)
 
-    if op == "eq":
-        if cv is not None and value not in cv:
-            return False
+    if op == "eq" and cv is not None and value not in cv:
+        return False
 
     if op == "ne":
         if has_nan:
@@ -407,12 +411,14 @@ def _query_receipt(query_id: str, read_row_groups: list[dict[str, Any]]) -> str:
     h.update(query_id.encode("utf-8"))
     h.update(b"|")
     for entry in read_row_groups:
-        h.update(f"{entry['row_group']}:{entry['decoded_rows']}:{entry['receipt']}".encode("utf-8"))
+        h.update(
+            f"{entry['row_group']}:{entry['decoded_rows']}:{entry['decoded_bytes']}:{entry['receipt']}".encode("utf-8")
+        )
         h.update(b"|")
     return h.hexdigest()
 
 
-def main() -> None:
+def build_index() -> None:
     queries = _load_queries()
     if not queries:
         raise RuntimeError("No queries available")
@@ -420,9 +426,29 @@ def main() -> None:
     pf = pq.ParquetFile(os.path.join(DATA_DIR, queries[0]["file"]))
     rg_index = _build_row_group_index(pf)
 
+    with open(INDEX_PATH, "wb") as f:
+        pickle.dump({"num_row_groups": pf.metadata.num_row_groups, "index": rg_index}, f)
+
+    print(f"Wrote {INDEX_PATH}")
+
+
+def run_query_pass() -> None:
+    if not os.path.exists(INDEX_PATH):
+        raise RuntimeError(f"Missing build-pass index: {INDEX_PATH}")
+
+    queries = _load_queries()
+    if not queries:
+        raise RuntimeError("No queries available")
+
+    pf = pq.ParquetFile(os.path.join(DATA_DIR, queries[0]["file"]))
+    with open(INDEX_PATH, "rb") as f:
+        payload = pickle.load(f)
+    rg_index: list[RowGroupIndex] = payload["index"]
+
     results_payload: list[dict[str, Any]] = []
     trace_records: list[dict[str, Any]] = []
 
+    query_phase_start = perf_counter()
     for query in queries:
         predicate = query.get("predicate")
         projection = query["columns"]
@@ -440,6 +466,7 @@ def main() -> None:
 
             decoded = pf.read_row_group(rg_idx, columns=read_columns)
             receipt = _receipt_for_table(decoded)
+            decoded_bytes = decoded.nbytes
 
             filtered = _apply_predicate(decoded, predicate)
             projected = filtered.select(projection)
@@ -449,6 +476,7 @@ def main() -> None:
                 {
                     "row_group": rg_idx,
                     "decoded_rows": decoded.num_rows,
+                    "decoded_bytes": decoded_bytes,
                     "receipt": receipt,
                 }
             )
@@ -463,6 +491,8 @@ def main() -> None:
         results_payload.append({"query_id": query["id"], "rows": rows})
         trace_records.append(trace_record)
 
+    elapsed_ms = int((perf_counter() - query_phase_start) * 1000)
+
     with open(RESULTS_PATH, "w", encoding="utf-8") as f:
         json.dump(results_payload, f, indent=2)
 
@@ -470,7 +500,26 @@ def main() -> None:
         for record in trace_records:
             f.write(json.dumps(record) + "\n")
 
+    with open(METRICS_PATH, "w", encoding="utf-8") as f:
+        json.dump({"query_pass_elapsed_ms": elapsed_ms}, f, indent=2)
+
     print(f"Wrote {RESULTS_PATH} and {TRACE_PATH}")
+    print(f"Query pass elapsed: {elapsed_ms} ms")
+
+
+def main() -> None:
+    mode = sys.argv[1] if len(sys.argv) > 1 else "query"
+    if mode == "build":
+        build_index()
+        return
+    if mode == "query":
+        run_query_pass()
+        return
+    if mode == "all":
+        build_index()
+        run_query_pass()
+        return
+    raise SystemExit("Usage: python solve.py [build|query|all]")
 
 
 if __name__ == "__main__":

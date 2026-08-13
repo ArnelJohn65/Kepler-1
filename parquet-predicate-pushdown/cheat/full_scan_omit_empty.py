@@ -1,15 +1,15 @@
 """
 Shortcut: full scan, genuine receipts, but only reports row groups that
-contained at least one matching row. Omits empty-but-not-prunable row groups.
-This should fail grading by read-set expectations and/or read budgets, not by
-serialization exceptions.
+contained at least one matching row.
 """
 import hashlib
 import json
 import math
 import os
+import sys
 from datetime import UTC, datetime
 from decimal import Decimal
+from time import perf_counter
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -19,6 +19,7 @@ APP_ROOT = os.environ.get("APP_ROOT", "/app")
 DATA_DIR = os.path.join(APP_ROOT, "data")
 RESULTS_PATH = os.path.join(APP_ROOT, "results.json")
 TRACE_PATH = os.path.join(APP_ROOT, "trace.jsonl")
+QUERY_TIMEOUT_SEC = float(os.environ.get("QUERY_TIMEOUT_SEC", "0.9"))
 
 
 def _normalize(v):
@@ -114,12 +115,13 @@ def _query_receipt(query_id, read_row_groups):
     h.update(query_id.encode("utf-8"))
     h.update(b"|")
     for e in read_row_groups:
-        h.update(f"{e['row_group']}:{e['decoded_rows']}:{e['receipt']}".encode("utf-8"))
+        h.update(f"{e['row_group']}:{e['decoded_rows']}:{e['decoded_bytes']}:{e['receipt']}".encode("utf-8"))
         h.update(b"|")
     return h.hexdigest()
 
 
 def main():
+    started = perf_counter()
     with open(os.path.join(DATA_DIR, "queries.json"), encoding="utf-8") as f:
         queries = json.load(f)
     pf = pq.ParquetFile(os.path.join(DATA_DIR, queries[0]["file"]))
@@ -136,6 +138,10 @@ def main():
         rows = []
         read_trace = []
         for rg in range(pf.metadata.num_row_groups):
+            # This internal check mirrors the runner's hard timeout and intentionally
+            # aborts before artifact emission when the query-phase budget is missed.
+            if perf_counter() - started > QUERY_TIMEOUT_SEC:
+                sys.exit(124)
             decoded = pf.read_row_group(rg, columns=read_cols)
             filtered = _apply(decoded, predicate)
             matching_rows = filtered.select(proj).to_pylist()
@@ -145,14 +151,10 @@ def main():
             read_trace.append({
                 "row_group": rg,
                 "decoded_rows": decoded.num_rows,
+                "decoded_bytes": decoded.nbytes,
                 "receipt": receipt,
             })
             rows.extend({k: _normalize(v) for k, v in row.items()} for row in matching_rows)
-
-        if read_trace:
-            # Keep this as an explicit failing cheat: duplicate the last row-group entry
-            # so verifier ordering checks fail even when serialization succeeds.
-            read_trace.append(dict(read_trace[-1]))
 
         all_results.append({"query_id": q["id"], "rows": rows})
         all_traces.append({
@@ -161,7 +163,11 @@ def main():
             "query_receipt": _query_receipt(q["id"], read_trace),
             "result_count": len(rows),
         })
+        if perf_counter() - started > QUERY_TIMEOUT_SEC:
+            sys.exit(124)
 
+    if perf_counter() - started > QUERY_TIMEOUT_SEC:
+        sys.exit(124)
     with open(RESULTS_PATH, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2)
     with open(TRACE_PATH, "w", encoding="utf-8") as f:

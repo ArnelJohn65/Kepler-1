@@ -7,4 +7,9 @@ if [ -z "${APP_ROOT:-}" ]; then
   export APP_ROOT=/app
 fi
 
-python "${SCRIPT_DIR}/solve.py"
+BUILD_TIMEOUT_SEC="${BUILD_TIMEOUT_SEC:-120}"
+# Deliberately tight query-phase budget to make full-scan query passes non-viable.
+QUERY_TIMEOUT_SEC="${QUERY_TIMEOUT_SEC:-0.9}"
+
+timeout "${BUILD_TIMEOUT_SEC}" python "${SCRIPT_DIR}/solve.py" build
+timeout "${QUERY_TIMEOUT_SEC}" python "${SCRIPT_DIR}/solve.py" query

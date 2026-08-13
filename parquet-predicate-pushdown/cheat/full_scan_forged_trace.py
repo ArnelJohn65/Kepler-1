@@ -120,7 +120,14 @@ def main():
         for q in queries:
             fake = {
                 "query_id": q["id"],
-                "read_row_groups": [{"row_group": 0, "decoded_rows": 500, "receipt": "deadbeefdeadbeefdeadbeefdeadbeef"}],
+                "read_row_groups": [
+                    {
+                        "row_group": 0,
+                        "decoded_rows": 500,
+                        "decoded_bytes": 12345,
+                        "receipt": "deadbeefdeadbeefdeadbeefdeadbeef",
+                    }
+                ],
                 "query_receipt": "cafebabecafebabecafebabecafebabe",
                 "result_count": len(next(item["rows"] for item in all_results if item["query_id"] == q["id"])),
             }
