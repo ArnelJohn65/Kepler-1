@@ -2,6 +2,9 @@ import hashlib
 import json
 import math
 import os
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
 from functools import lru_cache
 from typing import Any
 
@@ -18,7 +21,17 @@ APP_ROOT = os.environ.get("APP_ROOT", "/app")
 RESULTS_PATH = os.path.join(APP_ROOT, "results.json")
 TRACE_PATH = os.path.join(APP_ROOT, "trace.jsonl")
 
-MIN_EXPECTED_QUERIES = 9
+MIN_EXPECTED_QUERIES = 12
+
+PAIR_INDEX_COLUMNS = [("segment", "status"), ("region", "channel"), ("sku", "event_day")]
+
+
+@dataclass
+class ColumnStats:
+    min: Any
+    max: Any
+    null_count: int | None
+    num_rows: int
 
 
 def _read_query_specs() -> list[dict[str, Any]]:
@@ -63,11 +76,23 @@ def parquet_file(queries: list[dict[str, Any]]) -> pq.ParquetFile:
 def _normalize(v: Any) -> Any:
     if isinstance(v, float) and math.isnan(v):
         return "NaN"
+    if isinstance(v, Decimal):
+        return format(v, "f")
+    if isinstance(v, datetime):
+        return v.isoformat().replace("+00:00", "Z")
     return v
 
 
 def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
     return {k: _normalize(v) for k, v in row.items()}
+
+
+def _coerce_scalar(value: Any, dtype: pa.DataType) -> Any:
+    if pa.types.is_decimal(dtype):
+        return Decimal(str(value))
+    if pa.types.is_timestamp(dtype) and isinstance(value, str):
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return value
 
 
 def _columns_in_predicate(node: dict[str, Any] | None, output: set[str]) -> None:
@@ -93,7 +118,7 @@ def _build_mask(table: pa.Table, node: dict[str, Any]) -> pa.Array:
     if node_type == "cmp":
         col = table.column(node["column"])
         op = node["op"]
-        value = node["value"]
+        value = _coerce_scalar(node["value"], col.type)
         if op == "eq":
             return pc.equal(col, value)
         if op == "ne":
@@ -110,7 +135,8 @@ def _build_mask(table: pa.Table, node: dict[str, Any]) -> pa.Array:
 
     if node_type == "in":
         col = table.column(node["column"])
-        return pc.is_in(col, value_set=pa.array(node["values"], type=col.type))
+        coerced = [_coerce_scalar(v, col.type) for v in node["values"]]
+        return pc.is_in(col, value_set=pa.array(coerced, type=col.type))
 
     if node_type == "is_null":
         return pc.is_null(table.column(node["column"]))
@@ -164,59 +190,103 @@ def _query_receipt(query_id: str, read_row_groups: list[dict[str, Any]]) -> str:
     return h.hexdigest()
 
 
-def _ref_extract_stats(rg_meta: pq.RowGroupMetaData) -> dict[str, dict[str, Any]]:
-    out: dict[str, dict[str, Any]] = {}
+def _ref_extract_stats(rg_meta: pq.RowGroupMetaData) -> dict[str, ColumnStats]:
+    out: dict[str, ColumnStats] = {}
     for ci in range(rg_meta.num_columns):
         cmeta = rg_meta.column(ci)
         s = cmeta.statistics
-        if s is not None:
-            out[cmeta.path_in_schema] = {
-                "null_count": s.null_count,
-                "num_rows": rg_meta.num_rows,
-                "min": s.min if s.has_min_max else None,
-                "max": s.max if s.has_min_max else None,
-            }
+        if s is None:
+            out[cmeta.path_in_schema] = ColumnStats(None, None, None, rg_meta.num_rows)
         else:
-            out[cmeta.path_in_schema] = {
-                "null_count": None,
-                "num_rows": rg_meta.num_rows,
-                "min": None,
-                "max": None,
-            }
+            out[cmeta.path_in_schema] = ColumnStats(
+                s.min if s.has_min_max else None,
+                s.max if s.has_min_max else None,
+                s.null_count,
+                rg_meta.num_rows,
+            )
     return out
 
 
 def _ref_build_entry(table: pa.Table, rg_meta: pq.RowGroupMetaData) -> dict[str, Any]:
-    values: dict[str, set] = {}
+    values: dict[str, set[Any]] = {}
     has_null: dict[str, bool] = {}
+    has_nan: dict[str, bool] = {}
+
     for col_name in table.column_names:
         col = table.column(col_name)
         has_null[col_name] = col.null_count > 0
+
+        if pa.types.is_floating(col.type):
+            py_values = col.to_pylist()
+            has_nan[col_name] = any(isinstance(v, float) and math.isnan(v) for v in py_values if v is not None)
+
         if pa.types.is_string(col.type) or pa.types.is_integer(col.type):
             values[col_name] = set(col.drop_null().to_pylist())
-    return {"values": values, "has_null": has_null, "stats": _ref_extract_stats(rg_meta)}
+
+    pair_values: dict[str, set[tuple[Any, Any]]] = {}
+    for left, right in PAIR_INDEX_COLUMNS:
+        if left in table.column_names and right in table.column_names:
+            left_vals = table.column(left).to_pylist()
+            right_vals = table.column(right).to_pylist()
+            pair_values[f"{left}|{right}"] = {(a, b) for a, b in zip(left_vals, right_vals)}
+
+    return {
+        "values": values,
+        "has_null": has_null,
+        "has_nan": has_nan,
+        "stats": _ref_extract_stats(rg_meta),
+        "pair_values": pair_values,
+    }
 
 
-def _ref_cmp_may(entry: dict, column: str, op: str, value: Any) -> bool:
-    st = entry["stats"].get(column, {})
-    nc, nr = st.get("null_count"), st.get("num_rows", 0)
-    if nc is not None and nc >= nr > 0:
+def _nonnull_only(st: ColumnStats) -> bool:
+    return st.null_count == 0
+
+
+def _all_nulls(st: ColumnStats) -> bool:
+    return st.null_count is not None and st.null_count >= st.num_rows > 0
+
+
+def _coerce_for_stats_value(st: ColumnStats, value: Any) -> Any:
+    probe = st.min if st.min is not None else st.max
+    if isinstance(probe, Decimal):
+        return Decimal(str(value))
+    if isinstance(probe, datetime) and isinstance(value, str):
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return value
+
+
+def _ref_cmp_may(entry: dict[str, Any], column: str, op: str, value: Any) -> bool:
+    st = entry["stats"].get(column, ColumnStats(None, None, None, 0))
+    value = _coerce_for_stats_value(st, value)
+    if _all_nulls(st):
         return False
+
     cv = entry["values"].get(column)
-    rg_min, rg_max = st.get("min"), st.get("max")
+    has_nan = entry["has_nan"].get(column, False)
+
     if op == "eq":
+        if has_nan:
+            # NaN rows never satisfy eq. Unknown distribution means keep if any non-NaN could satisfy.
+            pass
         if cv is not None and value not in cv:
             return False
-        if rg_min is not None and rg_max is not None:
-            return not (value < rg_min or value > rg_max)
-        return True
+
     if op == "ne":
-        if cv is not None and len(cv) == 1 and value in cv and nc == 0:
+        if has_nan:
+            return True
+        if cv is not None and len(cv) == 1 and value in cv and _nonnull_only(st):
             return False
-        if rg_min is not None and rg_max is not None and rg_min == rg_max == value and nc == 0:
-            return False
-        return True
+
+    rg_min, rg_max = st.min, st.max
     if rg_min is None or rg_max is None:
+        return True
+
+    if op == "eq":
+        return not (value < rg_min or value > rg_max)
+    if op == "ne":
+        if rg_min == rg_max == value and _nonnull_only(st) and not has_nan:
+            return False
         return True
     if op == "lt":
         return rg_min < value
@@ -229,47 +299,62 @@ def _ref_cmp_may(entry: dict, column: str, op: str, value: Any) -> bool:
     return True
 
 
-def _ref_in_may(entry: dict, column: str, values: list) -> bool:
-    st = entry["stats"].get(column, {})
-    nc, nr = st.get("null_count"), st.get("num_rows", 0)
-    if nc is not None and nc >= nr > 0:
+def _ref_in_may(entry: dict[str, Any], column: str, values: list[Any]) -> bool:
+    st = entry["stats"].get(column, ColumnStats(None, None, None, 0))
+    allowed_values = [_coerce_for_stats_value(st, v) for v in values]
+    if _all_nulls(st):
         return False
-    allowed = set(values)
+
+    allowed = set(allowed_values)
     cv = entry["values"].get(column)
     if cv is not None and cv.isdisjoint(allowed):
         return False
-    rg_min, rg_max = st.get("min"), st.get("max")
+
+    rg_min, rg_max = st.min, st.max
     if rg_min is not None and rg_max is not None and all(v < rg_min or v > rg_max for v in allowed):
         return False
     return True
 
 
-def _ref_leaf_always_true(entry: dict, node: dict) -> bool:
+def _ref_leaf_always_true(entry: dict[str, Any], node: dict[str, Any]) -> bool:
     col = node["column"]
-    st = entry["stats"].get(col, {})
-    nc, nr = st.get("null_count"), st.get("num_rows", 0)
+    st = entry["stats"].get(col, ColumnStats(None, None, None, 0))
     t = node["type"]
+    has_nan = entry["has_nan"].get(col, False)
+
     if t == "is_null":
-        return nc is not None and nc == nr
+        return st.null_count is not None and st.null_count == st.num_rows
+
     if t == "is_not_null":
-        return nc == 0
+        return st.null_count == 0
+
     if t == "in":
-        if nc != 0:
+        allowed_values = [_coerce_for_stats_value(st, v) for v in node["values"]]
+        if not _nonnull_only(st):
             return False
         cv = entry["values"].get(col)
-        return cv is not None and cv.issubset(set(node["values"])) and len(cv) > 0
+        return cv is not None and cv.issubset(set(allowed_values)) and len(cv) > 0
+
     if t == "cmp":
-        if nc != 0:
+        if not _nonnull_only(st):
             return False
-        rg_min, rg_max = st.get("min"), st.get("max")
+
+        op, value = node["op"], _coerce_for_stats_value(st, node["value"])
+        rg_min, rg_max = st.min, st.max
         if rg_min is None or rg_max is None:
             return False
-        op, value = node["op"], node["value"]
+
         cv = entry["values"].get(col)
         if op == "eq":
+            if has_nan:
+                return False
             return (cv == {value}) if cv is not None else (rg_min == rg_max == value)
         if op == "ne":
+            if has_nan:
+                return True
             return (value not in cv) if cv is not None else (value < rg_min or value > rg_max)
+        if op in {"lt", "le", "gt", "ge"} and has_nan:
+            return False
         if op == "lt":
             return rg_max < value
         if op == "le":
@@ -278,10 +363,60 @@ def _ref_leaf_always_true(entry: dict, node: dict) -> bool:
             return rg_min > value
         if op == "ge":
             return rg_min >= value
+
     return False
 
 
-def _ref_may_be_false(entry: dict, node: dict) -> bool:
+def _flatten_and(node: dict[str, Any]) -> list[dict[str, Any]]:
+    if node["type"] != "and":
+        return [node]
+    leaves: list[dict[str, Any]] = []
+    for child in node["children"]:
+        leaves.extend(_flatten_and(child))
+    return leaves
+
+
+def _allowed_sets_for_and(node: dict[str, Any]) -> dict[str, set[Any]]:
+    allowed: dict[str, set[Any]] = {}
+    for leaf in _flatten_and(node):
+        t = leaf["type"]
+        if t == "cmp" and leaf["op"] == "eq":
+            vals = {leaf["value"]}
+        elif t == "in":
+            vals = set(leaf["values"])
+        elif t == "is_null":
+            vals = {None}
+        else:
+            continue
+
+        col = leaf["column"]
+        if col in allowed:
+            allowed[col] &= vals
+        else:
+            allowed[col] = set(vals)
+    return allowed
+
+
+def _pair_feasible(entry: dict[str, Any], node: dict[str, Any]) -> bool:
+    if node["type"] != "and":
+        return True
+    allowed = _allowed_sets_for_and(node)
+
+    for left, right in PAIR_INDEX_COLUMNS:
+        if left not in allowed or right not in allowed:
+            continue
+
+        pair_set = entry["pair_values"].get(f"{left}|{right}")
+        if pair_set is None:
+            continue
+
+        if not any((a, b) in pair_set for a in allowed[left] for b in allowed[right]):
+            return False
+
+    return True
+
+
+def _ref_may_be_false(entry: dict[str, Any], node: dict[str, Any]) -> bool:
     t = node["type"]
     if t == "and":
         return any(_ref_may_be_false(entry, c) for c in node["children"])
@@ -292,10 +427,12 @@ def _ref_may_be_false(entry: dict, node: dict) -> bool:
     return not _ref_leaf_always_true(entry, node)
 
 
-def _ref_may_be_true(entry: dict, node: dict) -> bool:
+def _ref_may_be_true(entry: dict[str, Any], node: dict[str, Any]) -> bool:
     t = node["type"]
     if t == "and":
-        return all(_ref_may_be_true(entry, c) for c in node["children"])
+        if not all(_ref_may_be_true(entry, c) for c in node["children"]):
+            return False
+        return _pair_feasible(entry, node)
     if t == "or":
         return any(_ref_may_be_true(entry, c) for c in node["children"])
     if t == "not":
@@ -305,16 +442,14 @@ def _ref_may_be_true(entry: dict, node: dict) -> bool:
     if t == "in":
         return _ref_in_may(entry, node["column"], node["values"])
     if t == "is_null":
-        st = entry["stats"].get(node["column"], {})
-        nc = st.get("null_count")
-        if nc is not None:
-            return nc > 0
+        st = entry["stats"].get(node["column"], ColumnStats(None, None, None, 0))
+        if st.null_count is not None:
+            return st.null_count > 0
         return entry["has_null"].get(node["column"], True)
     if t == "is_not_null":
-        st = entry["stats"].get(node["column"], {})
-        nc, nr = st.get("null_count"), st.get("num_rows", 0)
-        if nc is not None:
-            return nc < nr
+        st = entry["stats"].get(node["column"], ColumnStats(None, None, None, 0))
+        if st.null_count is not None:
+            return st.null_count < st.num_rows
         return True
     return True
 
@@ -450,6 +585,28 @@ def reference_rows_by_query(
     return out
 
 
+@pytest.fixture(scope="session")
+def reference_matching_row_groups_by_query(
+    queries: list[dict[str, Any]], parquet_file: pq.ParquetFile
+) -> dict[str, set[int]]:
+    out: dict[str, set[int]] = {}
+    for query in queries:
+        predicate = query.get("predicate")
+        projection = query["columns"]
+        required = set(projection)
+        _columns_in_predicate(predicate, required)
+        read_columns = sorted(required)
+
+        groups: set[int] = set()
+        for rg_idx in range(parquet_file.metadata.num_row_groups):
+            decoded = parquet_file.read_row_group(rg_idx, columns=read_columns)
+            filtered = _apply_predicate(decoded, predicate)
+            if filtered.num_rows > 0:
+                groups.add(rg_idx)
+        out[query["id"]] = groups
+    return out
+
+
 def test_results_and_trace_files_exist() -> None:
     assert os.path.exists(RESULTS_PATH), f"missing agent artifact: {RESULTS_PATH}"
     assert os.path.exists(TRACE_PATH), f"missing agent artifact: {TRACE_PATH}"
@@ -459,6 +616,41 @@ def test_expected_query_count(queries: list[dict[str, Any]]) -> None:
     assert len(queries) >= MIN_EXPECTED_QUERIES, (
         f"verifier query spec must define at least {MIN_EXPECTED_QUERIES} queries, found {len(queries)}"
     )
+
+
+@pytest.fixture(scope="session")
+def rg_index(parquet_file: pq.ParquetFile) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for rg_idx in range(parquet_file.metadata.num_row_groups):
+        rg_meta = parquet_file.metadata.row_group(rg_idx)
+        table = parquet_file.read_row_group(rg_idx)
+        result.append(_ref_build_entry(table, rg_meta))
+    return result
+
+
+@pytest.fixture(scope="session")
+def reference_read_set_by_query(
+    queries_by_id: dict[str, dict[str, Any]], rg_index: list[dict[str, Any]]
+) -> dict[str, set[int]]:
+    out: dict[str, set[int]] = {}
+    for query_id, query in queries_by_id.items():
+        predicate = query.get("predicate")
+        out[query_id] = {
+            rg_idx
+            for rg_idx, entry in enumerate(rg_index)
+            if predicate is None or _ref_may_be_true(entry, predicate)
+        }
+    return out
+
+
+def test_reference_pruner_includes_empty_groups(
+    reference_read_set_by_query: dict[str, set[int]],
+    reference_matching_row_groups_by_query: dict[str, set[int]],
+) -> None:
+    assert any(
+        len(reference_read_set_by_query[qid] - reference_matching_row_groups_by_query[qid]) > 0
+        for qid in reference_read_set_by_query
+    ), "dataset/query design must include at least one query with empty-but-non-prunable row groups"
 
 
 def test_query_results_match_reference(
@@ -517,28 +709,12 @@ def test_trace_receipts_match_decoded_bytes(
     assert record["query_receipt"] == expected_query_receipt, f"query_receipt mismatch for {query_id}"
 
 
-@pytest.fixture(scope="session")
-def rg_index(parquet_file: pq.ParquetFile) -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = []
-    for rg_idx in range(parquet_file.metadata.num_row_groups):
-        rg_meta = parquet_file.metadata.row_group(rg_idx)
-        table = parquet_file.read_row_group(rg_idx)
-        result.append(_ref_build_entry(table, rg_meta))
-    return result
-
-
 def test_query_read_set_matches_reference(
     query_id: str,
-    queries_by_id: dict[str, dict[str, Any]],
     trace_by_id: dict[str, dict[str, Any]],
-    rg_index: list[dict[str, Any]],
+    reference_read_set_by_query: dict[str, set[int]],
 ) -> None:
-    predicate = queries_by_id[query_id].get("predicate")
-    reference_set = {
-        rg_idx
-        for rg_idx, entry in enumerate(rg_index)
-        if predicate is None or _ref_may_be_true(entry, predicate)
-    }
+    reference_set = reference_read_set_by_query[query_id]
     agent_set = {e["row_group"] for e in trace_by_id[query_id]["read_row_groups"]}
     assert agent_set == reference_set, (
         f"{query_id}: reported row-group set does not match the sound-pruner reference. "
