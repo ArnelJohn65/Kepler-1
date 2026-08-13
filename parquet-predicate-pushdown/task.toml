@@ -1,0 +1,27 @@
+artifacts = ["/app/results.json", "/app/trace.jsonl"]
+
+[task]
+name = "afterquery/parquet-predicate-pushdown"
+description = "Fix a latent min/max statistics bug and implement row-group predicate pushdown in a columnar query engine."
+
+[agent]
+timeout_sec = 14400
+
+[verifier]
+environment_mode = "separate"
+timeout_sec = 3600
+
+[resource]
+gpus = 0
+
+[metadata]
+author_name = "Arnel John"
+author_email = "arneljohn65@example.com"
+difficulty_explanation = "Requires finding a subtle off-by-one in a statistics writer, understanding how Parquet row-group metadata works, implementing predicate pushdown in a planner that is not trivially extensible, and handling NULL edge cases — each step builds on the last and any mistake in the statistics layer breaks pruning correctness."
+solution_explanation = "The off-by-one is in the inclusive/exclusive boundary of the max-value accumulator. Once fixed, the planner can compare query predicates against per-row-group min/max and skip groups that cannot contain matching rows. NULL handling requires that IS NULL predicates are never pruned away (min/max stats exclude nulls), and negated predicates must be treated conservatively."
+verification_explanation = "The verifier checks query results against a ground-truth table and also reads /app/trace.jsonl to count how many row groups were actually read. Correct pruning must reduce the number of row groups read below a threshold that is impossible to reach by accident or by returning hardcoded answers — the threshold is computed from the dataset structure."
+category = "Software"
+subcategory = "Databases"
+tags = ["parquet", "query-engine", "predicate-pushdown", "columnar", "statistics", "debugging"]
+expert_time_estimate_hours = 4
+relevant_experience = "I have worked on columnar storage engines and query optimizers for several years, including implementing predicate pushdown for Parquet and ORC formats in production data lake systems."
