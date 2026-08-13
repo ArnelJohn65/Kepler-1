@@ -18,7 +18,7 @@ APP_ROOT = os.environ.get("APP_ROOT", "/app")
 RESULTS_PATH = os.path.join(APP_ROOT, "results.json")
 TRACE_PATH = os.path.join(APP_ROOT, "trace.jsonl")
 
-MIN_EXPECTED_QUERIES = 8
+MIN_EXPECTED_QUERIES = 9
 
 
 def _read_query_specs() -> list[dict[str, Any]]:
@@ -162,6 +162,161 @@ def _query_receipt(query_id: str, read_row_groups: list[dict[str, Any]]) -> str:
         h.update(f"{entry['row_group']}:{entry['decoded_rows']}:{entry['receipt']}".encode("utf-8"))
         h.update(b"|")
     return h.hexdigest()
+
+
+def _ref_extract_stats(rg_meta: pq.RowGroupMetaData) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for ci in range(rg_meta.num_columns):
+        cmeta = rg_meta.column(ci)
+        s = cmeta.statistics
+        if s is not None:
+            out[cmeta.path_in_schema] = {
+                "null_count": s.null_count,
+                "num_rows": rg_meta.num_rows,
+                "min": s.min if s.has_min_max else None,
+                "max": s.max if s.has_min_max else None,
+            }
+        else:
+            out[cmeta.path_in_schema] = {
+                "null_count": None,
+                "num_rows": rg_meta.num_rows,
+                "min": None,
+                "max": None,
+            }
+    return out
+
+
+def _ref_build_entry(table: pa.Table, rg_meta: pq.RowGroupMetaData) -> dict[str, Any]:
+    values: dict[str, set] = {}
+    has_null: dict[str, bool] = {}
+    for col_name in table.column_names:
+        col = table.column(col_name)
+        has_null[col_name] = col.null_count > 0
+        if pa.types.is_string(col.type) or pa.types.is_integer(col.type):
+            values[col_name] = set(col.drop_null().to_pylist())
+    return {"values": values, "has_null": has_null, "stats": _ref_extract_stats(rg_meta)}
+
+
+def _ref_cmp_may(entry: dict, column: str, op: str, value: Any) -> bool:
+    st = entry["stats"].get(column, {})
+    nc, nr = st.get("null_count"), st.get("num_rows", 0)
+    if nc is not None and nc >= nr > 0:
+        return False
+    cv = entry["values"].get(column)
+    rg_min, rg_max = st.get("min"), st.get("max")
+    if op == "eq":
+        if cv is not None and value not in cv:
+            return False
+        if rg_min is not None and rg_max is not None:
+            return not (value < rg_min or value > rg_max)
+        return True
+    if op == "ne":
+        if cv is not None and len(cv) == 1 and value in cv and nc == 0:
+            return False
+        if rg_min is not None and rg_max is not None and rg_min == rg_max == value and nc == 0:
+            return False
+        return True
+    if rg_min is None or rg_max is None:
+        return True
+    if op == "lt":
+        return rg_min < value
+    if op == "le":
+        return rg_min <= value
+    if op == "gt":
+        return rg_max > value
+    if op == "ge":
+        return rg_max >= value
+    return True
+
+
+def _ref_in_may(entry: dict, column: str, values: list) -> bool:
+    st = entry["stats"].get(column, {})
+    nc, nr = st.get("null_count"), st.get("num_rows", 0)
+    if nc is not None and nc >= nr > 0:
+        return False
+    allowed = set(values)
+    cv = entry["values"].get(column)
+    if cv is not None and cv.isdisjoint(allowed):
+        return False
+    rg_min, rg_max = st.get("min"), st.get("max")
+    if rg_min is not None and rg_max is not None and all(v < rg_min or v > rg_max for v in allowed):
+        return False
+    return True
+
+
+def _ref_leaf_always_true(entry: dict, node: dict) -> bool:
+    col = node["column"]
+    st = entry["stats"].get(col, {})
+    nc, nr = st.get("null_count"), st.get("num_rows", 0)
+    t = node["type"]
+    if t == "is_null":
+        return nc is not None and nc == nr
+    if t == "is_not_null":
+        return nc == 0
+    if t == "in":
+        if nc != 0:
+            return False
+        cv = entry["values"].get(col)
+        return cv is not None and cv.issubset(set(node["values"])) and len(cv) > 0
+    if t == "cmp":
+        if nc != 0:
+            return False
+        rg_min, rg_max = st.get("min"), st.get("max")
+        if rg_min is None or rg_max is None:
+            return False
+        op, value = node["op"], node["value"]
+        cv = entry["values"].get(col)
+        if op == "eq":
+            return (cv == {value}) if cv is not None else (rg_min == rg_max == value)
+        if op == "ne":
+            return (value not in cv) if cv is not None else (value < rg_min or value > rg_max)
+        if op == "lt":
+            return rg_max < value
+        if op == "le":
+            return rg_max <= value
+        if op == "gt":
+            return rg_min > value
+        if op == "ge":
+            return rg_min >= value
+    return False
+
+
+def _ref_may_be_false(entry: dict, node: dict) -> bool:
+    t = node["type"]
+    if t == "and":
+        return any(_ref_may_be_false(entry, c) for c in node["children"])
+    if t == "or":
+        return all(_ref_may_be_false(entry, c) for c in node["children"])
+    if t == "not":
+        return _ref_may_be_true(entry, node["child"])
+    return not _ref_leaf_always_true(entry, node)
+
+
+def _ref_may_be_true(entry: dict, node: dict) -> bool:
+    t = node["type"]
+    if t == "and":
+        return all(_ref_may_be_true(entry, c) for c in node["children"])
+    if t == "or":
+        return any(_ref_may_be_true(entry, c) for c in node["children"])
+    if t == "not":
+        return _ref_may_be_false(entry, node["child"])
+    if t == "cmp":
+        return _ref_cmp_may(entry, node["column"], node["op"], node["value"])
+    if t == "in":
+        return _ref_in_may(entry, node["column"], node["values"])
+    if t == "is_null":
+        st = entry["stats"].get(node["column"], {})
+        nc = st.get("null_count")
+        if nc is not None:
+            return nc > 0
+        return entry["has_null"].get(node["column"], True)
+    if t == "is_not_null":
+        st = entry["stats"].get(node["column"], {})
+        nc, nr = st.get("null_count"), st.get("num_rows", 0)
+        if nc is not None:
+            return nc < nr
+        return True
+    return True
 
 
 @lru_cache(maxsize=1)
@@ -360,3 +515,34 @@ def test_trace_receipts_match_decoded_bytes(
 
     expected_query_receipt = _query_receipt(query_id, reads)
     assert record["query_receipt"] == expected_query_receipt, f"query_receipt mismatch for {query_id}"
+
+
+@pytest.fixture(scope="session")
+def rg_index(parquet_file: pq.ParquetFile) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for rg_idx in range(parquet_file.metadata.num_row_groups):
+        rg_meta = parquet_file.metadata.row_group(rg_idx)
+        table = parquet_file.read_row_group(rg_idx)
+        result.append(_ref_build_entry(table, rg_meta))
+    return result
+
+
+def test_query_read_set_matches_reference(
+    query_id: str,
+    queries_by_id: dict[str, dict[str, Any]],
+    trace_by_id: dict[str, dict[str, Any]],
+    rg_index: list[dict[str, Any]],
+) -> None:
+    predicate = queries_by_id[query_id].get("predicate")
+    reference_set = {
+        rg_idx
+        for rg_idx, entry in enumerate(rg_index)
+        if predicate is None or _ref_may_be_true(entry, predicate)
+    }
+    agent_set = {e["row_group"] for e in trace_by_id[query_id]["read_row_groups"]}
+    assert agent_set == reference_set, (
+        f"{query_id}: reported row-group set does not match the sound-pruner reference. "
+        f"Agent: {sorted(agent_set)}, reference: {sorted(reference_set)}. "
+        f"Missing (must appear even when empty): {sorted(reference_set - agent_set)}. "
+        f"Extra (provably prunable): {sorted(agent_set - reference_set)}."
+    )
