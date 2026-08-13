@@ -3,11 +3,17 @@ import os
 import random
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any
 
 import pyarrow as pa
-import pyarrow.compute as pc
 import pyarrow.parquet as pq
+
+from verifier_helpers import (
+    apply_predicate,
+    build_reference_index,
+    columns_in_predicate,
+    index_json_bytes,
+    may_index_row_group_match,
+)
 
 TESTS_ROOT = os.environ.get("TESTS_ROOT", "/tests")
 OUT_DIR = os.path.join(TESTS_ROOT, "data")
@@ -121,89 +127,7 @@ def make_row_group(group_idx: int) -> pa.Table:
     )
 
 
-def _coerce_scalar(value: Any, dtype: pa.DataType) -> Any:
-    if pa.types.is_decimal(dtype):
-        return Decimal(str(value))
-    if pa.types.is_timestamp(dtype) and isinstance(value, str):
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return value
-
-
-def _build_mask(table: pa.Table, node: dict[str, Any]) -> pa.Array:
-    t = node["type"]
-    if t == "cmp":
-        col = table.column(node["column"])
-        op = node["op"]
-        value = _coerce_scalar(node["value"], col.type)
-        if op == "eq":
-            return pc.equal(col, value)
-        if op == "ne":
-            return pc.not_equal(col, value)
-        if op == "lt":
-            return pc.less(col, value)
-        if op == "le":
-            return pc.less_equal(col, value)
-        if op == "gt":
-            return pc.greater(col, value)
-        if op == "ge":
-            return pc.greater_equal(col, value)
-        raise AssertionError(f"unsupported cmp op in query spec: {op}")
-
-    if t == "in":
-        col = table.column(node["column"])
-        coerced = [_coerce_scalar(v, col.type) for v in node["values"]]
-        return pc.is_in(col, value_set=pa.array(coerced, type=col.type))
-
-    if t == "is_null":
-        return pc.is_null(table.column(node["column"]))
-
-    if t == "is_not_null":
-        return pc.is_valid(table.column(node["column"]))
-
-    if t == "and":
-        masks = [_build_mask(table, child) for child in node["children"]]
-        out = masks[0]
-        for mask in masks[1:]:
-            out = pc.and_(out, mask)
-        return out
-
-    if t == "or":
-        masks = [_build_mask(table, child) for child in node["children"]]
-        out = masks[0]
-        for mask in masks[1:]:
-            out = pc.or_(out, mask)
-        return out
-
-    if t == "not":
-        return pc.invert(_build_mask(table, node["child"]))
-
-    raise AssertionError(f"unsupported node type in query spec: {t}")
-
-
-def _apply_predicate(table: pa.Table, predicate: dict[str, Any] | None) -> pa.Table:
-    if predicate is None:
-        return table
-    return table.filter(_build_mask(table, predicate))
-
-
-def _columns_in_predicate(node: dict[str, Any] | None, output: set[str]) -> None:
-    if node is None:
-        return
-    node_type = node["type"]
-    if node_type in {"cmp", "in", "is_null", "is_not_null"}:
-        output.add(node["column"])
-        return
-    if node_type in {"and", "or"}:
-        for child in node["children"]:
-            _columns_in_predicate(child, output)
-        return
-    if node_type == "not":
-        _columns_in_predicate(node["child"], output)
-        return
-    raise AssertionError(f"unknown predicate node type in query spec: {node_type}")
-
-
-def build_queries() -> list[dict[str, Any]]:
+def build_visible_queries() -> list[dict]:
     return [
         {
             "id": "q1",
@@ -218,8 +142,6 @@ def build_queries() -> list[dict[str, Any]]:
                     {"type": "cmp", "column": "status", "op": "eq", "value": "hold"},
                 ],
             },
-            "budget_slack": 2,
-            "min_result_count": 1,
         },
         {
             "id": "q2",
@@ -234,8 +156,6 @@ def build_queries() -> list[dict[str, Any]]:
                     {"type": "cmp", "column": "status", "op": "eq", "value": "pending"},
                 ],
             },
-            "budget_slack": 2,
-            "min_result_count": 1,
         },
         {
             "id": "q3",
@@ -249,8 +169,6 @@ def build_queries() -> list[dict[str, Any]]:
                     {"type": "cmp", "column": "status", "op": "eq", "value": "closed"},
                 ],
             },
-            "budget_slack": 2,
-            "min_result_count": 1,
         },
         {
             "id": "q4",
@@ -265,8 +183,6 @@ def build_queries() -> list[dict[str, Any]]:
                     {"type": "cmp", "column": "amount", "op": "lt", "value": 470.0},
                 ],
             },
-            "budget_slack": 3,
-            "min_result_count": 1,
         },
         {
             "id": "q5",
@@ -289,8 +205,6 @@ def build_queries() -> list[dict[str, Any]]:
                     {"type": "in", "column": "sku", "values": ["SKU010", "SKU011", "SKU012"]},
                 ],
             },
-            "budget_slack": 2,
-            "min_result_count": 1,
         },
         {
             "id": "q6",
@@ -305,8 +219,6 @@ def build_queries() -> list[dict[str, Any]]:
                     {"type": "cmp", "column": "region", "op": "eq", "value": "EMEA"},
                 ],
             },
-            "budget_slack": 2,
-            "min_result_count": 1,
         },
         {
             "id": "q7",
@@ -321,8 +233,6 @@ def build_queries() -> list[dict[str, Any]]:
                     {"type": "cmp", "column": "segment", "op": "eq", "value": "enterprise"},
                 ],
             },
-            "budget_slack": 3,
-            "min_result_count": 1,
         },
         {
             "id": "q8",
@@ -336,8 +246,6 @@ def build_queries() -> list[dict[str, Any]]:
                     {"type": "cmp", "column": "amount_dec", "op": "le", "value": "1080.00"},
                 ],
             },
-            "budget_slack": 4,
-            "min_result_count": 1,
         },
         {
             "id": "q9",
@@ -353,8 +261,6 @@ def build_queries() -> list[dict[str, Any]]:
                     {"type": "cmp", "column": "amount", "op": "lt", "value": 360.0},
                 ],
             },
-            "budget_slack": 2,
-            "min_result_count": 1,
         },
         {
             "id": "q10",
@@ -368,8 +274,6 @@ def build_queries() -> list[dict[str, Any]]:
                     {"type": "cmp", "column": "segment", "op": "eq", "value": "enterprise"},
                 ],
             },
-            "budget_slack": 2,
-            "min_result_count": 1,
         },
         {
             "id": "q11",
@@ -384,8 +288,6 @@ def build_queries() -> list[dict[str, Any]]:
                     {"type": "cmp", "column": "amount", "op": "lt", "value": 150.0},
                 ],
             },
-            "budget_slack": 2,
-            "min_result_count": 1,
         },
         {
             "id": "q12",
@@ -399,53 +301,210 @@ def build_queries() -> list[dict[str, Any]]:
                     {"type": "cmp", "column": "amount", "op": "lt", "value": 100.0},
                 ],
             },
-            "budget_slack": 2,
-            "min_result_count": 1,
         },
     ]
 
 
-def finalize_query_budgets(parquet_path: str, queries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    pf = pq.ParquetFile(parquet_path)
-    total_row_groups = pf.metadata.num_row_groups
+def build_hidden_queries() -> list[dict]:
+    return [
+        {
+            "id": "h1",
+            "columns": ["id", "segment", "status", "amount"],
+            "predicate": {
+                "type": "and",
+                "children": [
+                    {"type": "cmp", "column": "segment", "op": "eq", "value": "enterprise"},
+                    {"type": "cmp", "column": "status", "op": "eq", "value": "pending"},
+                    {"type": "cmp", "column": "amount", "op": "gt", "value": 600.0},
+                ],
+            },
+        },
+        {
+            "id": "h2",
+            "columns": ["id", "segment", "status", "amount"],
+            "predicate": {
+                "type": "and",
+                "children": [
+                    {"type": "cmp", "column": "segment", "op": "eq", "value": "retail"},
+                    {"type": "cmp", "column": "status", "op": "eq", "value": "pending"},
+                    {"type": "cmp", "column": "amount", "op": "ge", "value": 400.0},
+                    {"type": "cmp", "column": "amount", "op": "lt", "value": 520.0},
+                ],
+            },
+        },
+        {
+            "id": "h3",
+            "columns": ["id", "priority", "segment", "amount"],
+            "predicate": {
+                "type": "and",
+                "children": [
+                    {"type": "is_null", "column": "priority"},
+                    {"type": "cmp", "column": "segment", "op": "eq", "value": "midmarket"},
+                    {"type": "cmp", "column": "amount", "op": "ge", "value": 200.0},
+                    {"type": "cmp", "column": "amount", "op": "lt", "value": 260.0},
+                ],
+            },
+        },
+        {
+            "id": "h4",
+            "columns": ["id", "score", "status", "amount"],
+            "predicate": {
+                "type": "and",
+                "children": [
+                    {"type": "is_null", "column": "score"},
+                    {"type": "cmp", "column": "status", "op": "eq", "value": "hold"},
+                    {"type": "cmp", "column": "amount", "op": "lt", "value": 100.0},
+                ],
+            },
+        },
+        {
+            "id": "h5",
+            "columns": ["id", "segment", "status", "amount"],
+            "predicate": {
+                "type": "and",
+                "children": [
+                    {"type": "not", "child": {"type": "in", "column": "region", "values": ["APAC"]}},
+                    {"type": "cmp", "column": "segment", "op": "eq", "value": "startup"},
+                    {"type": "cmp", "column": "status", "op": "eq", "value": "fraud"},
+                    {"type": "cmp", "column": "amount", "op": "ge", "value": 100.0},
+                    {"type": "cmp", "column": "amount", "op": "lt", "value": 200.0},
+                ],
+            },
+        },
+        {
+            "id": "h6",
+            "columns": ["id", "priority", "region", "amount"],
+            "predicate": {
+                "type": "and",
+                "children": [
+                    {"type": "in", "column": "priority", "values": [4, 5]},
+                    {"type": "cmp", "column": "region", "op": "eq", "value": "EMEA"},
+                    {"type": "cmp", "column": "amount", "op": "gt", "value": 900.0},
+                ],
+            },
+        },
+        {
+            "id": "h7",
+            "columns": ["id", "channel", "region", "event_day"],
+            "predicate": {
+                "type": "and",
+                "children": [
+                    {"type": "is_null", "column": "channel"},
+                    {"type": "cmp", "column": "region", "op": "eq", "value": "APAC"},
+                    {"type": "cmp", "column": "event_day", "op": "eq", "value": 19509},
+                ],
+            },
+        },
+        {
+            "id": "h8",
+            "columns": ["id", "segment", "status", "priority", "amount"],
+            "predicate": {
+                "type": "and",
+                "children": [
+                    {"type": "cmp", "column": "segment", "op": "eq", "value": "gov"},
+                    {"type": "cmp", "column": "status", "op": "eq", "value": "closed"},
+                    {"type": "is_null", "column": "priority"},
+                    {"type": "cmp", "column": "amount", "op": "ge", "value": 300.0},
+                    {"type": "cmp", "column": "amount", "op": "lt", "value": 420.0},
+                ],
+            },
+        },
+        {
+            "id": "h9",
+            "columns": ["id", "sku", "event_day", "status"],
+            "predicate": {
+                "type": "and",
+                "children": [
+                    {"type": "cmp", "column": "sku", "op": "eq", "value": "SKU001"},
+                    {"type": "cmp", "column": "event_day", "op": "eq", "value": 19516},
+                    {"type": "cmp", "column": "status", "op": "eq", "value": "closed"},
+                ],
+            },
+        },
+        {
+            "id": "h10",
+            "columns": ["id", "amount_dec", "sku", "segment"],
+            "predicate": {
+                "type": "and",
+                "children": [
+                    {"type": "cmp", "column": "sku", "op": "eq", "value": "SKU006"},
+                    {"type": "cmp", "column": "event_day", "op": "eq", "value": 19501},
+                    {"type": "cmp", "column": "amount_dec", "op": "lt", "value": "180.00"},
+                ],
+            },
+        },
+        {
+            "id": "h11",
+            "columns": ["id", "amount", "score", "sku"],
+            "predicate": {
+                "type": "and",
+                "children": [
+                    {"type": "is_not_null", "column": "score"},
+                    {
+                        "type": "not",
+                        "child": {
+                            "type": "or",
+                            "children": [
+                                {"type": "cmp", "column": "amount", "op": "lt", "value": 510.0},
+                                {"type": "cmp", "column": "amount", "op": "gt", "value": 630.0},
+                            ],
+                        },
+                    },
+                    {"type": "in", "column": "sku", "values": ["SKU039", "SKU040", "SKU041"]},
+                ],
+            },
+        },
+        {
+            "id": "h12",
+            "columns": ["id", "region", "segment", "priority", "amount"],
+            "predicate": {
+                "type": "and",
+                "children": [
+                    {"type": "not", "child": {"type": "in", "column": "region", "values": ["APAC"]}},
+                    {"type": "in", "column": "priority", "values": [1, 2]},
+                    {"type": "cmp", "column": "amount", "op": "gt", "value": 900.0},
+                    {"type": "cmp", "column": "segment", "op": "eq", "value": "enterprise"},
+                ],
+            },
+        },
+    ]
 
-    for query in queries:
+
+def add_precision_ceilings(parquet_path: str, hidden_queries: list[dict]) -> tuple[list[dict], int]:
+    parquet_file = pq.ParquetFile(parquet_path)
+    schema = {field.name: field.type for field in parquet_file.schema_arrow}
+    index_payload = build_reference_index(parquet_file)
+
+    for query in hidden_queries:
         predicate = query.get("predicate")
-        projection = query["columns"]
-
-        required = set(projection)
-        _columns_in_predicate(predicate, required)
-        read_columns = sorted(required)
-
         matching_groups = 0
-        all_group_bytes: list[int] = []
-
-        for rg_idx in range(total_row_groups):
-            decoded = pf.read_row_group(rg_idx, columns=read_columns)
-            all_group_bytes.append(decoded.nbytes)
-            if _apply_predicate(decoded, predicate).num_rows > 0:
+        surviving_groups = 0
+        read_columns = set(query["columns"])
+        columns_in_predicate(predicate, read_columns)
+        for row_group_entry in index_payload["row_groups"]:
+            if may_index_row_group_match(row_group_entry, schema, predicate):
+                surviving_groups += 1
+        for row_group_index in range(parquet_file.metadata.num_row_groups):
+            decoded = parquet_file.read_row_group(row_group_index, columns=sorted(read_columns))
+            if apply_predicate(decoded, predicate).num_rows > 0:
                 matching_groups += 1
 
-        assert matching_groups > 0, f"{query['id']} must have at least one matching row group"
+        assert matching_groups > 0, f"{query['id']} must match at least one row group"
+        assert surviving_groups >= matching_groups, f"{query['id']} reference index must be sound"
+        query["max_surviving_row_groups"] = surviving_groups
 
-        max_reads = matching_groups + int(query.pop("budget_slack"))
-        assert max_reads < total_row_groups, f"{query['id']} max_row_groups_read must be less than total row groups"
-        assert max_reads <= max(1, total_row_groups // 5), f"{query['id']} max_row_groups_read is too loose"
-
-        query["max_row_groups_read"] = max_reads
-        query["max_decoded_bytes"] = sum(sorted(all_group_bytes, reverse=True)[:max_reads])
-
-    return queries
+    return hidden_queries, len(index_json_bytes(index_payload))
 
 
 def main() -> None:
     parquet_path = os.path.join(OUT_DIR, "sales.parquet")
-    queries_path = os.path.join(OUT_DIR, "queries.json")
+    visible_queries_path = os.path.join(OUT_DIR, "queries.json")
+    hidden_queries_path = os.path.join(OUT_DIR, "hidden_queries.json")
 
     writer = None
     try:
-        for rg in range(ROW_GROUPS):
-            table = make_row_group(rg)
+        for row_group_index in range(ROW_GROUPS):
+            table = make_row_group(row_group_index)
             if writer is None:
                 writer = pq.ParquetWriter(
                     parquet_path,
@@ -468,11 +527,16 @@ def main() -> None:
         if writer is not None:
             writer.close()
 
-    queries = finalize_query_budgets(parquet_path, build_queries())
-    with open(queries_path, "w", encoding="utf-8") as f:
-        json.dump(queries, f, indent=2)
+    visible_queries = build_visible_queries()
+    hidden_queries, reference_index_size = add_precision_ceilings(parquet_path, build_hidden_queries())
+
+    with open(visible_queries_path, "w", encoding="utf-8") as f:
+        json.dump(visible_queries, f, indent=2)
+    with open(hidden_queries_path, "w", encoding="utf-8") as f:
+        json.dump(hidden_queries, f, indent=2)
 
     print(f"Generated {parquet_path} with {ROW_GROUPS} row groups")
+    print(f"Reference index size: {reference_index_size} bytes")
 
 
 if __name__ == "__main__":

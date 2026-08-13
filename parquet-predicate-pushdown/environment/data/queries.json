@@ -1,0 +1,472 @@
+[
+  {
+    "id": "q1",
+    "file": "sales.parquet",
+    "columns": [
+      "id",
+      "amount",
+      "region",
+      "status"
+    ],
+    "predicate": {
+      "type": "and",
+      "children": [
+        {
+          "type": "cmp",
+          "column": "amount",
+          "op": "ge",
+          "value": 20.0
+        },
+        {
+          "type": "cmp",
+          "column": "amount",
+          "op": "lt",
+          "value": 90.0
+        },
+        {
+          "type": "in",
+          "column": "region",
+          "values": [
+            "APAC"
+          ]
+        },
+        {
+          "type": "cmp",
+          "column": "status",
+          "op": "eq",
+          "value": "hold"
+        }
+      ]
+    }
+  },
+  {
+    "id": "q2",
+    "file": "sales.parquet",
+    "columns": [
+      "id",
+      "amount",
+      "segment",
+      "status",
+      "sku"
+    ],
+    "predicate": {
+      "type": "and",
+      "children": [
+        {
+          "type": "cmp",
+          "column": "amount",
+          "op": "ge",
+          "value": 760.0
+        },
+        {
+          "type": "cmp",
+          "column": "amount",
+          "op": "lt",
+          "value": 940.0
+        },
+        {
+          "type": "cmp",
+          "column": "segment",
+          "op": "eq",
+          "value": "enterprise"
+        },
+        {
+          "type": "cmp",
+          "column": "status",
+          "op": "eq",
+          "value": "pending"
+        }
+      ]
+    }
+  },
+  {
+    "id": "q3",
+    "file": "sales.parquet",
+    "columns": [
+      "id",
+      "event_day",
+      "region",
+      "status",
+      "event_ts"
+    ],
+    "predicate": {
+      "type": "and",
+      "children": [
+        {
+          "type": "cmp",
+          "column": "event_day",
+          "op": "eq",
+          "value": 19507
+        },
+        {
+          "type": "cmp",
+          "column": "region",
+          "op": "eq",
+          "value": "EMEA"
+        },
+        {
+          "type": "cmp",
+          "column": "status",
+          "op": "eq",
+          "value": "closed"
+        }
+      ]
+    }
+  },
+  {
+    "id": "q4",
+    "file": "sales.parquet",
+    "columns": [
+      "id",
+      "priority",
+      "region",
+      "segment",
+      "amount"
+    ],
+    "predicate": {
+      "type": "and",
+      "children": [
+        {
+          "type": "is_null",
+          "column": "priority"
+        },
+        {
+          "type": "cmp",
+          "column": "segment",
+          "op": "eq",
+          "value": "gov"
+        },
+        {
+          "type": "cmp",
+          "column": "amount",
+          "op": "ge",
+          "value": 330.0
+        },
+        {
+          "type": "cmp",
+          "column": "amount",
+          "op": "lt",
+          "value": 470.0
+        }
+      ]
+    }
+  },
+  {
+    "id": "q5",
+    "file": "sales.parquet",
+    "columns": [
+      "id",
+      "amount",
+      "score",
+      "sku"
+    ],
+    "predicate": {
+      "type": "and",
+      "children": [
+        {
+          "type": "is_not_null",
+          "column": "score"
+        },
+        {
+          "type": "not",
+          "child": {
+            "type": "or",
+            "children": [
+              {
+                "type": "cmp",
+                "column": "amount",
+                "op": "lt",
+                "value": 400.0
+              },
+              {
+                "type": "cmp",
+                "column": "amount",
+                "op": "gt",
+                "value": 620.0
+              }
+            ]
+          }
+        },
+        {
+          "type": "in",
+          "column": "sku",
+          "values": [
+            "SKU010",
+            "SKU011",
+            "SKU012"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "id": "q6",
+    "file": "sales.parquet",
+    "columns": [
+      "id",
+      "event_day",
+      "status",
+      "region",
+      "event_ts"
+    ],
+    "predicate": {
+      "type": "and",
+      "children": [
+        {
+          "type": "cmp",
+          "column": "event_day",
+          "op": "ge",
+          "value": 19518
+        },
+        {
+          "type": "cmp",
+          "column": "event_day",
+          "op": "le",
+          "value": 19519
+        },
+        {
+          "type": "in",
+          "column": "status",
+          "values": [
+            "hold",
+            "pending"
+          ]
+        },
+        {
+          "type": "cmp",
+          "column": "region",
+          "op": "eq",
+          "value": "EMEA"
+        }
+      ]
+    }
+  },
+  {
+    "id": "q7",
+    "file": "sales.parquet",
+    "columns": [
+      "id",
+      "region",
+      "segment",
+      "priority",
+      "amount"
+    ],
+    "predicate": {
+      "type": "and",
+      "children": [
+        {
+          "type": "not",
+          "child": {
+            "type": "in",
+            "column": "region",
+            "values": [
+              "APAC"
+            ]
+          }
+        },
+        {
+          "type": "in",
+          "column": "priority",
+          "values": [
+            1,
+            2
+          ]
+        },
+        {
+          "type": "cmp",
+          "column": "amount",
+          "op": "gt",
+          "value": 900.0
+        },
+        {
+          "type": "cmp",
+          "column": "segment",
+          "op": "eq",
+          "value": "enterprise"
+        }
+      ]
+    }
+  },
+  {
+    "id": "q8",
+    "file": "sales.parquet",
+    "columns": [
+      "id",
+      "segment",
+      "sku",
+      "amount",
+      "amount_dec"
+    ],
+    "predicate": {
+      "type": "and",
+      "children": [
+        {
+          "type": "cmp",
+          "column": "sku",
+          "op": "eq",
+          "value": "SKU031"
+        },
+        {
+          "type": "cmp",
+          "column": "segment",
+          "op": "ne",
+          "value": "startup"
+        },
+        {
+          "type": "cmp",
+          "column": "amount_dec",
+          "op": "le",
+          "value": "1080.00"
+        }
+      ]
+    }
+  },
+  {
+    "id": "q9",
+    "file": "sales.parquet",
+    "columns": [
+      "id",
+      "segment",
+      "status",
+      "priority",
+      "amount"
+    ],
+    "predicate": {
+      "type": "and",
+      "children": [
+        {
+          "type": "cmp",
+          "column": "segment",
+          "op": "eq",
+          "value": "startup"
+        },
+        {
+          "type": "cmp",
+          "column": "status",
+          "op": "eq",
+          "value": "pending"
+        },
+        {
+          "type": "is_null",
+          "column": "priority"
+        },
+        {
+          "type": "cmp",
+          "column": "amount",
+          "op": "ge",
+          "value": 200.0
+        },
+        {
+          "type": "cmp",
+          "column": "amount",
+          "op": "lt",
+          "value": 360.0
+        }
+      ]
+    }
+  },
+  {
+    "id": "q10",
+    "file": "sales.parquet",
+    "columns": [
+      "id",
+      "region",
+      "segment",
+      "status"
+    ],
+    "predicate": {
+      "type": "and",
+      "children": [
+        {
+          "type": "cmp",
+          "column": "region",
+          "op": "eq",
+          "value": "EMEA"
+        },
+        {
+          "type": "cmp",
+          "column": "status",
+          "op": "eq",
+          "value": "fraud"
+        },
+        {
+          "type": "cmp",
+          "column": "segment",
+          "op": "eq",
+          "value": "enterprise"
+        }
+      ]
+    }
+  },
+  {
+    "id": "q11",
+    "file": "sales.parquet",
+    "columns": [
+      "id",
+      "amount",
+      "region",
+      "sku",
+      "event_day"
+    ],
+    "predicate": {
+      "type": "and",
+      "children": [
+        {
+          "type": "cmp",
+          "column": "sku",
+          "op": "eq",
+          "value": "SKU001"
+        },
+        {
+          "type": "cmp",
+          "column": "event_day",
+          "op": "eq",
+          "value": 19500
+        },
+        {
+          "type": "cmp",
+          "column": "amount",
+          "op": "ge",
+          "value": 0.0
+        },
+        {
+          "type": "cmp",
+          "column": "amount",
+          "op": "lt",
+          "value": 150.0
+        }
+      ]
+    }
+  },
+  {
+    "id": "q12",
+    "file": "sales.parquet",
+    "columns": [
+      "id",
+      "score",
+      "amount",
+      "status"
+    ],
+    "predicate": {
+      "type": "and",
+      "children": [
+        {
+          "type": "is_null",
+          "column": "score"
+        },
+        {
+          "type": "cmp",
+          "column": "status",
+          "op": "eq",
+          "value": "hold"
+        },
+        {
+          "type": "cmp",
+          "column": "amount",
+          "op": "lt",
+          "value": 100.0
+        }
+      ]
+    }
+  }
+]
