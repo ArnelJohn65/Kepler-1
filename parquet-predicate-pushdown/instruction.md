@@ -1,32 +1,15 @@
-The query engine at `/app/engine/` has a predicate-pushdown system that's not finished. Right now it reads every row group for every query, no matter what the predicate says. Your job is to make it actually prune row groups using the per-row-group min/max statistics that are already stored in the Parquet footers.
+The query engine in /app/engine/ works, but it's slow for a dumb reason. Every query reads every row group in the file, even when the statistics already tell us the row group can't contain a matching row. Nobody ever wired the pruning up.
 
-There are two problems you need to fix.
+There's a second problem underneath that one. The code that writes the per row group min/max stats has an off by one in it. You won't notice it on most queries. It shows up on boundary predicates, where the constant in the predicate is exactly equal to the min or the max of a row group. Fix that first. If you build pruning on top of bad stats you'll start dropping rows that should have come back, and the results will be quietly wrong instead of loudly broken.
 
-**Off-by-one in the statistics writer.** The code that writes min/max values for each row group has a boundary bug. Predicates that land exactly on the min or max value of a row group get wrong statistics, which causes incorrect pruning. Find it and fix it before you implement pruning.
+Then add row group pruning to the planner so it skips row groups the stats rule out.
 
-**No pruning in the planner.** The planner currently ignores statistics entirely. Add logic so that before reading a row group, the engine checks whether the predicate can possibly match anything in that row group. If the statistics prove no row in the group can match, skip it.
+Watch the nulls. Nulls aren't counted in min/max, so a row group full of nulls has stats that look empty or misleading. IS NULL has to keep working, and so do negated predicates. Don't prune a row group just because its stats don't overlap the predicate range if nulls could still satisfy it. This is where I'd expect this to go wrong.
 
-**Null handling.** Nulls are excluded from min/max statistics. That means you cannot use min/max to prune `IS NULL` predicates or negated predicates — doing so would give wrong results. Make sure your pruning logic leaves those cases alone.
+Run the full query suite and write the answers to /app/results.json.
 
-## What to produce
+Also write an execution trace to /app/trace.jsonl recording which row groups were actually read for each query. One JSON object per line. This is how the pruning gets measured, so it has to reflect real reads, not what you intended to read.
 
-Run the engine against the provided queries and write two output files.
+You're done when both files exist, the results are correct, and the trace shows the engine is genuinely skipping row groups.
 
-**`/app/results.json`** — query results. One JSON object per line (or a JSON array — check the engine's existing output format and match it). Each entry must include the query identifier and the result rows.
-
-**`/app/trace.jsonl`** — execution trace. One JSON object per line, one per query. Each object must record which row groups were actually read for that query. For example:
-
-```json
-{"query_id": "q1", "row_groups_read": [0, 2]}
-```
-
-Both files are required. Use those exact absolute paths.
-
-## Done means
-
-- Results in `/app/results.json` match the correct answers for every query.
-- The trace in `/app/trace.jsonl` shows that at least some queries with equality or range predicates on non-null columns read fewer row groups than the total. If every query reads every row group, the solution is wrong even if the result rows are correct.
-- Null-related queries return correct results and are not pruned incorrectly.
-- The off-by-one fix is in place so boundary-value predicates work.
-
-You have 1800 seconds to complete this task. Do not cheat by using online solutions or hints specific to this task.
+You have 14400 seconds to complete this task. Do not cheat by using online solutions or hints specific to this task.
