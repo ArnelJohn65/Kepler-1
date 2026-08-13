@@ -1,8 +1,8 @@
 The dataset is at /app/data/sales.parquet. A query specification is at /app/data/queries.json.
 
-The build pass runs before the query pass. The build pass may read the parquet file and write any index or summary to /app/. The build pass must not read /app/data/queries.json. It should produce an index that works for any predicate over the schema, without knowing the specific queries in advance.
+The build pass runs before the query pass. The runner hides /app/data/queries.json during the build pass and restores it only after build completes. The build pass may read the parquet file and must write its persisted index to /app/row_group_index.pkl. That index must work for any predicate over the schema without knowing the specific queries in advance.
 
-The query pass runs after the build pass. It reads /app/data/queries.json and the index from /app/. For each query, it reads only the row groups that the index cannot prove are empty, decodes those groups, filters them, and writes the results.
+The query pass runs after the build pass. It reads /app/data/queries.json and /app/row_group_index.pkl. For each query, it reads only the row groups that the index cannot prove are empty, decodes those groups, filters them, and writes the results.
 
 Each query in queries.json has:
 - id
@@ -14,7 +14,7 @@ Each query in queries.json has:
 
 Predicate nodes: and, or, not, cmp, in, is_null, is_not_null. cmp ops: eq, ne, lt, le, gt, ge.
 
-I need two artifacts:
+I need three artifacts:
 
 1) /app/results.json
 - JSON array
@@ -37,6 +37,11 @@ Each read_row_groups element must have exactly:
 
 Row groups in each query trace must be strictly increasing by row_group index.
 
+3) /app/row_group_index.pkl
+- persisted build-pass index artifact
+- must be the same index that the query pass loads
+- verifier enforces a size cap on this artifact
+
 Value encoding requirements for both results.json rows and receipt row JSON payloads:
 - timestamps: ISO 8601 UTC with Z suffix
 - decimals: format(Decimal, "f")
@@ -47,6 +52,7 @@ Value encoding requirements for both results.json rows and receipt row JSON payl
 Receipt requirements:
 - For each query, define receipt columns as sorted(unique(projection columns union predicate columns)).
 - For each reported row group, decode exactly those receipt columns for every row in that row group.
+- decoded_bytes must equal pyarrow Table.nbytes for that decoded receipt-column table.
 - start blake2b with digest_size=16
 - hash UTF-8 bytes of "rows=N" where N is decoded row count
 - for each decoded row in order, hash JSON(row) with sorted keys and no spaces, then hash a newline byte
@@ -59,6 +65,7 @@ query_receipt format:
 - lowercase hex digest is the query_receipt
 
 result_count must equal the number of rows for that query in results.json.
+Each query must also return at least min_result_count rows.
 
 Per query, both budgets must hold:
 - len(read_row_groups) <= max_row_groups_read

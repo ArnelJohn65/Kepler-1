@@ -22,7 +22,20 @@ QUERIES_PATH = os.path.join(DATA_DIR, "queries.json")
 APP_ROOT = os.environ.get("APP_ROOT", "/app")
 RESULTS_PATH = os.path.join(APP_ROOT, "results.json")
 TRACE_PATH = os.path.join(APP_ROOT, "trace.jsonl")
+INDEX_PATH = os.path.join(APP_ROOT, "row_group_index.pkl")
+INDEX_SIZE_CAP_BYTES = 2 * 1024 * 1024
 
+
+def _artifact_size_bytes(path: str) -> int:
+    if os.path.isfile(path):
+        return os.path.getsize(path)
+    if os.path.isdir(path):
+        total = 0
+        for root, _, files in os.walk(path):
+            for name in files:
+                total += os.path.getsize(os.path.join(root, name))
+        return total
+    pytest.fail(f"missing agent artifact: {path}", pytrace=False)
 
 
 def _read_query_specs() -> list[dict[str, Any]]:
@@ -229,6 +242,14 @@ def reference_matching_row_groups_by_query(
 def test_results_and_trace_files_exist() -> None:
     assert os.path.exists(RESULTS_PATH), f"missing agent artifact: {RESULTS_PATH}"
     assert os.path.exists(TRACE_PATH), f"missing agent artifact: {TRACE_PATH}"
+
+
+def test_index_size_cap() -> None:
+    assert os.path.exists(INDEX_PATH), f"missing agent artifact: {INDEX_PATH}"
+    size_bytes = _artifact_size_bytes(INDEX_PATH)
+    assert size_bytes <= INDEX_SIZE_CAP_BYTES, (
+        f"persisted index artifact is too large: {size_bytes} bytes exceeds {INDEX_SIZE_CAP_BYTES}"
+    )
 
 
 def test_query_results_match_reference(
