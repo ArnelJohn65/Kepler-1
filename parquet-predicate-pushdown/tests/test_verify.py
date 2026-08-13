@@ -27,10 +27,8 @@ def _read_query_specs() -> list[dict[str, Any]]:
 
 
 def _query_params() -> list[Any]:
-    # A missing verifier query spec is a hard failure, never a skip: the sentinel
-    # param is collected so every test still runs and fails loudly.
     if not os.path.exists(QUERIES_PATH):
-        return [pytest.param("__missing_query_spec__", id="missing-queries-json")]
+        pytest.fail(f"verifier query spec missing: {QUERIES_PATH} — verifier image was not built correctly", pytrace=False)
     return [pytest.param(q["id"], id=q["id"]) for q in _read_query_specs()]
 
 

@@ -30,7 +30,7 @@ skipped = s.get('skipped', 0)
 errors = s.get('errors', 0)
 pending = s.get('pending', 0)
 print(passed, failed, skipped, errors, pending)
-" 2>/dev/null || echo "0 1 0 0 0")
+" 2>>/logs/verifier/pytest.log || echo "0 1 0 0 0")
 
 read -r PASS FAIL SKIP ERR PEND <<< "$PASSED"
 
