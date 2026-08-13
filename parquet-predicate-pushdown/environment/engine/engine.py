@@ -33,11 +33,10 @@ def _compute_stats(table: pa.Table, col: str):
         return None, None
     sorted_arr = pa.compute.sort_indices(arr)
     min_val = arr[sorted_arr[0].as_py()].as_py()
-    # BUG: should be sorted_arr[len(sorted_arr) - 1], not sorted_arr[len(sorted_arr)]
-    try:
-        max_val = arr[sorted_arr[len(sorted_arr)].as_py()].as_py()
-    except IndexError:
-        max_val = arr[sorted_arr[len(sorted_arr) - 1].as_py()].as_py()
+    # BUG: uses index len(sorted_arr) - 2 instead of len(sorted_arr) - 1, so the
+    # true maximum value is never reported. Boundary predicates that land on the
+    # real max will be incorrectly pruned.
+    max_val = arr[sorted_arr[len(sorted_arr) - 2].as_py()].as_py()
     return min_val, max_val
 
 

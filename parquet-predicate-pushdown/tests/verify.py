@@ -91,10 +91,10 @@ def verify_pruning(trace: dict) -> list[str]:
         rgs_read = trace[qid]
         pruned = set(range(TOTAL_ROW_GROUPS)) - rgs_read
 
-        if exp["pruned_rgs"] and not (exp["pruned_rgs"] & pruned):
+        if exp["pruned_rgs"] and not exp["pruned_rgs"].issubset(pruned):
             errors.append(
-                f"{qid}: expected row groups {exp['pruned_rgs']} to be pruned, "
-                f"but read all of: {rgs_read}"
+                f"{qid}: expected all of row groups {exp['pruned_rgs']} to be pruned, "
+                f"but actually pruned only: {pruned} (read: {rgs_read})"
             )
 
         # q4 IS NULL — must read all row groups

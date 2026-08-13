@@ -52,7 +52,7 @@ queries = [
     # q4: IS NULL on nullable_col — must NOT prune incorrectly
     {"id": "q4", "file": "sales.parquet", "predicate": {"column": "nullable_col", "op": "is_null"}, "columns": ["id", "nullable_col"]},
     # q5: boundary value — exact max of rg0 (off-by-one bug manifests here)
-    {"id": "q5", "file": "sales.parquet", "predicate": {"column": "id", "op": "eq", "value": 99}, "columns": ["id", "amount"]},
+    {"id": "q5", "file": "sales.parquet", "predicate": {"column": "id", "op": "eq", "value": 99}, "columns": ["id"]},
     # q6: no predicate — reads everything
     {"id": "q6", "file": "sales.parquet", "predicate": None, "columns": ["id", "amount", "category"]},
 ]
