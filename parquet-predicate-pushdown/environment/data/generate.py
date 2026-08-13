@@ -43,8 +43,9 @@ def make_row_group(group_idx: int) -> tuple[pa.Table, dict]:
     status_primary = statuses[group_idx % len(statuses)]
     status_secondary = statuses[(group_idx + 1) % len(statuses)]
 
-    sku_slice_start = (group_idx * 3) % (len(skus) - 4)
-    group_skus = skus[sku_slice_start : sku_slice_start + 4]
+    window = len(skus)
+    sku_slice_start = (group_idx * 3) % window
+    group_skus = [skus[(sku_slice_start + offset) % len(skus)] for offset in range(4)]
 
     for row_offset in range(n):
         global_id = group_idx * ROWS_PER_GROUP + row_offset
@@ -136,6 +137,7 @@ def build_queries() -> list[dict]:
                 ],
             },
             "max_row_groups_read": 6,
+            "min_result_count": 1,
         },
         {
             "id": "q2",
@@ -155,6 +157,7 @@ def build_queries() -> list[dict]:
                 ],
             },
             "max_row_groups_read": 8,
+            "min_result_count": 1,
         },
         {
             "id": "q3",
@@ -172,6 +175,7 @@ def build_queries() -> list[dict]:
                 ],
             },
             "max_row_groups_read": 4,
+            "min_result_count": 1,
         },
         {
             "id": "q4",
@@ -191,6 +195,7 @@ def build_queries() -> list[dict]:
                 ],
             },
             "max_row_groups_read": 12,
+            "min_result_count": 1,
         },
         {
             "id": "q5",
@@ -214,6 +219,7 @@ def build_queries() -> list[dict]:
                 ],
             },
             "max_row_groups_read": 5,
+            "min_result_count": 1,
         },
         {
             "id": "q6",
@@ -228,6 +234,7 @@ def build_queries() -> list[dict]:
                 ],
             },
             "max_row_groups_read": 6,
+            "min_result_count": 1,
         },
         {
             "id": "q7",
@@ -248,6 +255,7 @@ def build_queries() -> list[dict]:
                 ],
             },
             "max_row_groups_read": 8,
+            "min_result_count": 1,
         },
         {
             "id": "q8",
@@ -262,6 +270,7 @@ def build_queries() -> list[dict]:
                 ],
             },
             "max_row_groups_read": 4,
+            "min_result_count": 1,
         },
     ]
 

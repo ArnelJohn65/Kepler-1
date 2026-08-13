@@ -27,6 +27,7 @@ The verifier checks two things at the same time:
 2. Real row-group pruning based on `max_row_groups_read` in each query spec.
 
 The verifier also recomputes row-group receipts from decoded Parquet data and checks them against your trace.
+Each query spec also includes `min_result_count`, and your output must satisfy it.
 
 Do not change file names or key names in either artifact.
 

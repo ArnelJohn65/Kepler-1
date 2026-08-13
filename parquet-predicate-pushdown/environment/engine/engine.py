@@ -163,6 +163,12 @@ def _may_match(node: dict[str, Any], rg_meta: pq.RowGroupMetaData, index_entry: 
         return _cmp_may_match(stats, node["op"], node["value"])
 
     if node_type == "in":
+        stats = _extract_stats(rg_meta, node["column"])
+        if stats.get("null_count") is not None and stats["null_count"] >= stats["num_rows"]:
+            return False
+        indexed_values = set(index_entry.get("values", {}).get(node["column"], []))
+        if indexed_values:
+            return not indexed_values.isdisjoint(set(node["values"]))
         return True
 
     if node_type == "is_null":
@@ -186,7 +192,10 @@ def _may_match(node: dict[str, Any], rg_meta: pq.RowGroupMetaData, index_entry: 
                 return False
         return True
 
-    if node_type in {"or", "not"}:
+    if node_type == "or":
+        return any(_may_match(child, rg_meta, index_entry) for child in node["children"])
+
+    if node_type == "not":
         return True
 
     return True

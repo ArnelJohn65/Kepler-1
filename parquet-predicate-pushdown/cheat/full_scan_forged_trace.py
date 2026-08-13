@@ -72,7 +72,8 @@ def _apply(table, predicate):
 
 
 def main():
-    queries = json.load(open(os.path.join(DATA_DIR, "queries.json"), encoding="utf-8"))
+    with open(os.path.join(DATA_DIR, "queries.json"), encoding="utf-8") as f:
+        queries = json.load(f)
     pf = pq.ParquetFile(os.path.join(DATA_DIR, queries[0]["file"]))
 
     all_results = []
