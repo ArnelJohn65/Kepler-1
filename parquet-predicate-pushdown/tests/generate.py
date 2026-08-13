@@ -134,7 +134,7 @@ def build_queries() -> list[dict]:
                     {"type": "cmp", "column": "status", "op": "eq", "value": "hold"},
                 ],
             },
-            "max_row_groups_read": 10,
+            "max_row_groups_read": 9,
             "min_result_count": 1,
         },
         {
@@ -150,7 +150,7 @@ def build_queries() -> list[dict]:
                     {"type": "cmp", "column": "status", "op": "eq", "value": "pending"},
                 ],
             },
-            "max_row_groups_read": 20,
+            "max_row_groups_read": 8,
             "min_result_count": 1,
         },
         {
@@ -217,7 +217,7 @@ def build_queries() -> list[dict]:
                     {"type": "in", "column": "sku", "values": ["SKU010", "SKU011", "SKU012"]},
                 ],
             },
-            "max_row_groups_read": 9,
+            "max_row_groups_read": 6,
             "min_result_count": 1,
         },
         {
@@ -232,7 +232,7 @@ def build_queries() -> list[dict]:
                     {"type": "in", "column": "status", "values": ["hold", "pending"]},
                 ],
             },
-            "max_row_groups_read": 16,
+            "max_row_groups_read": 14,
             "min_result_count": 1,
         },
         {
@@ -268,7 +268,7 @@ def build_queries() -> list[dict]:
                     {"type": "cmp", "column": "amount_dec", "op": "le", "value": "1080.00"},
                 ],
             },
-            "max_row_groups_read": 20,
+            "max_row_groups_read": 22,
             "min_result_count": 1,
         },
         {

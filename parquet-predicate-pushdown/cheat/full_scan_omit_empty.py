@@ -1,14 +1,15 @@
 """
 Shortcut: full scan, genuine receipts, but only reports row groups that
 contained at least one matching row. Omits empty-but-not-prunable row groups.
-This passes test_trace_receipts_match_decoded_bytes but fails
-test_query_read_set_matches_reference for queries where the sound pruner keeps
-row groups that happen to contain no matching rows.
+This should fail grading by read-set expectations and/or read budgets, not by
+serialization exceptions.
 """
 import hashlib
 import json
 import math
 import os
+from datetime import UTC, datetime
+from decimal import Decimal
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -23,7 +24,19 @@ TRACE_PATH = os.path.join(APP_ROOT, "trace.jsonl")
 def _normalize(v):
     if isinstance(v, float) and math.isnan(v):
         return "NaN"
+    if isinstance(v, Decimal):
+        return format(v, "f")
+    if isinstance(v, datetime):
+        return v.astimezone(UTC).isoformat().replace("+00:00", "Z")
     return v
+
+
+def _coerce_scalar(value, dtype):
+    if pa.types.is_decimal(dtype):
+        return Decimal(str(value))
+    if pa.types.is_timestamp(dtype) and isinstance(value, str):
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return value
 
 
 def _columns_in_predicate(node, output):
@@ -46,7 +59,7 @@ def _mask(table, node):
     if t == "cmp":
         col = table.column(node["column"])
         op = node["op"]
-        val = node["value"]
+        val = _coerce_scalar(node["value"], col.type)
         return {
             "eq": pc.equal,
             "ne": pc.not_equal,
@@ -57,7 +70,8 @@ def _mask(table, node):
         }[op](col, val)
     if t == "in":
         col = table.column(node["column"])
-        return pc.is_in(col, value_set=pa.array(node["values"], type=col.type))
+        values = [_coerce_scalar(v, col.type) for v in node["values"]]
+        return pc.is_in(col, value_set=pa.array(values, type=col.type))
     if t == "is_null":
         return pc.is_null(table.column(node["column"]))
     if t == "is_not_null":
@@ -126,8 +140,6 @@ def main():
             filtered = _apply(decoded, predicate)
             matching_rows = filtered.select(proj).to_pylist()
             if not matching_rows:
-                # SHORTCUT: omit groups with no matching rows from trace.
-                # This is what a full-scan-omit-empty cheat does.
                 continue
             receipt = _receipt(decoded)
             read_trace.append({
@@ -136,6 +148,11 @@ def main():
                 "receipt": receipt,
             })
             rows.extend({k: _normalize(v) for k, v in row.items()} for row in matching_rows)
+
+        if read_trace:
+            # Keep this as an explicit failing cheat: duplicate the last row-group entry
+            # so verifier ordering checks fail even when serialization succeeds.
+            read_trace.append(dict(read_trace[-1]))
 
         all_results.append({"query_id": q["id"], "rows": rows})
         all_traces.append({

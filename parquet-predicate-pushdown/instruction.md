@@ -21,6 +21,15 @@ Each read_row_groups element must have exactly: row_group (non-negative integer)
 
 Row groups in each query trace must be strictly increasing by row_group index.
 
+Any row group that I choose to read must be listed in read_row_groups, even when that row group contributes zero rows to results.
+
+Value encoding requirements for both results.json rows and receipt row JSON payloads:
+- timestamps: ISO 8601 UTC with Z suffix
+- decimals: format(Decimal, "f")
+- regular floats: JSON number
+- NaN: the string "NaN"
+- null: JSON null
+
 receipt format:
 - start blake2b with digest_size=16
 - hash UTF-8 bytes of "rows=N" where N is decoded row count
