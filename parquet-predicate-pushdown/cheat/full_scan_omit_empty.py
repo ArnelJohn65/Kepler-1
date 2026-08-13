@@ -19,7 +19,7 @@ APP_ROOT = os.environ.get("APP_ROOT", "/app")
 DATA_DIR = os.path.join(APP_ROOT, "data")
 RESULTS_PATH = os.path.join(APP_ROOT, "results.json")
 TRACE_PATH = os.path.join(APP_ROOT, "trace.jsonl")
-QUERY_TIMEOUT_SEC = float(os.environ.get("QUERY_TIMEOUT_SEC", "0.9"))
+QUERY_TIMEOUT_SEC = float(os.environ.get("QUERY_TIMEOUT_SEC", "1.6"))
 
 
 def _normalize(v):
