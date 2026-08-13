@@ -1,15 +1,33 @@
-The query engine in /app/engine/ works, but it's slow for a dumb reason. Every query reads every row group in the file, even when the statistics already tell us the row group can't contain a matching row. Nobody ever wired the pruning up.
+I need you to improve the query execution path in `/app/engine/` and then run the full query set.
 
-There's a second problem underneath that one. The code that writes the per row group min/max stats has an off by one in it. You won't notice it on most queries. It shows up on boundary predicates, where the constant in the predicate is exactly equal to the min or the max of a row group. Fix that first. If you build pruning on top of bad stats you'll start dropping rows that should have come back, and the results will be quietly wrong instead of loudly broken.
+The dataset and query specs are under `/app/data/`.
 
-Then add row group pruning to the planner so it skips row groups the stats rule out.
+Each query in `/app/data/queries.json` uses a predicate tree. Nodes can be `and`, `or`, or `not`. Leaf predicates include comparison (`eq`, `ne`, `lt`, `le`, `gt`, `ge`), `in`, `is_null`, and `is_not_null`.
 
-Watch the nulls. Nulls aren't counted in min/max, so a row group full of nulls has stats that look empty or misleading. IS NULL has to keep working, and so do negated predicates. Don't prune a row group just because its stats don't overlap the predicate range if nulls could still satisfy it. This is where I'd expect this to go wrong.
+Your output files must be:
+- `/app/results.json`
+- `/app/trace.jsonl`
 
-Run the full query suite and write the answers to /app/results.json.
+`/app/results.json` must be a JSON array. Each item must be an object with:
+- `query_id` (string)
+- `rows` (array of row objects)
 
-Also write an execution trace to /app/trace.jsonl recording which row groups were actually read for each query. One JSON object per line. This is how the pruning gets measured, so it has to reflect real reads, not what you intended to read.
+`/app/trace.jsonl` must contain one JSON object per line, exactly one line per query. Each object must contain:
+- `query_id` (string)
+- `read_row_groups` (array of objects)
+  - each read-row-group object must contain:
+    - `row_group` (integer)
+    - `decoded_rows` (integer)
+    - `receipt` (string)
+- `query_receipt` (string)
+- `result_count` (integer)
 
-You're done when both files exist, the results are correct, and the trace shows the engine is genuinely skipping row groups.
+The verifier checks two things at the same time:
+1. Correct query answers for every query.
+2. Real row-group pruning based on `max_row_groups_read` in each query spec.
+
+The verifier also recomputes row-group receipts from decoded Parquet data and checks them against your trace.
+
+Do not change file names or key names in either artifact.
 
 You have 14400 seconds to complete this task. Do not cheat by using online solutions or hints specific to this task.
