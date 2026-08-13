@@ -25,7 +25,7 @@ APP_ROOT = os.environ.get("APP_ROOT", "/app")
 DATA_DIR = os.path.join(APP_ROOT, "data")
 RESULTS_PATH = os.path.join(APP_ROOT, "results.json")
 TRACE_PATH = os.path.join(APP_ROOT, "trace.jsonl")
-INDEX_PATH = os.path.join(DATA_DIR, "row_group_index.pkl")
+INDEX_PATH = os.path.join(APP_ROOT, "row_group_index.pkl")
 
 
 def _normalize(v: Any) -> Any:
@@ -131,10 +131,12 @@ def _query_receipt(query_id: str, read_row_groups: list[dict[str, Any]]) -> str:
 
 
 def build_index() -> None:
-    queries = _load_queries()
-    if not queries:
-        raise RuntimeError("No queries available")
-    pf = pq.ParquetFile(os.path.join(DATA_DIR, queries[0]["file"]))
+    import glob as _glob
+    matches = _glob.glob(os.path.join(DATA_DIR, "*.parquet"))
+    if not matches:
+        raise RuntimeError(f"No parquet file found in {DATA_DIR}")
+    parquet_path = sorted(matches)[0]
+    pf = pq.ParquetFile(parquet_path)
 
     # Baseline placeholder index: only row counts and stat presence.
     stats = []
@@ -143,7 +145,7 @@ def build_index() -> None:
         stats.append({"row_group": rg_idx, "num_rows": rg.num_rows, "num_columns": rg.num_columns})
 
     with open(INDEX_PATH, "wb") as f:
-        pickle.dump({"row_groups": stats}, f)
+        pickle.dump({"parquet": os.path.basename(parquet_path), "row_groups": stats}, f)
 
     print(f"Wrote {INDEX_PATH}")
 
@@ -155,7 +157,9 @@ def run_queries() -> None:
     queries = _load_queries()
     if not queries:
         raise RuntimeError("No queries available")
-    pf = pq.ParquetFile(os.path.join(DATA_DIR, queries[0]["file"]))
+    with open(INDEX_PATH, "rb") as f:
+        payload = pickle.load(f)
+    pf = pq.ParquetFile(os.path.join(DATA_DIR, payload["parquet"]))
 
     all_results: list[dict[str, Any]] = []
     all_traces: list[dict[str, Any]] = []
