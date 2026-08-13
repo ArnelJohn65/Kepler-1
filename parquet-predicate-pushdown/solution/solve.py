@@ -1,13 +1,9 @@
-import hashlib
 import json
 import math
 import os
-import pickle
 import sys
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from time import perf_counter
 from typing import Any
 
 import pyarrow as pa
@@ -17,28 +13,8 @@ import pyarrow.parquet as pq
 APP_ROOT = os.environ.get("APP_ROOT", "/app")
 DATA_DIR = os.path.join(APP_ROOT, "data")
 RESULTS_PATH = os.path.join(APP_ROOT, "results.json")
-TRACE_PATH = os.path.join(APP_ROOT, "trace.jsonl")
-INDEX_PATH = os.path.join(APP_ROOT, "row_group_index.pkl")
-METRICS_PATH = os.path.join(APP_ROOT, "query_metrics.json")
-
+INDEX_PATH = os.path.join(APP_ROOT, "row_group_index.json")
 PAIR_INDEX_COLUMNS = [("segment", "status"), ("region", "channel"), ("sku", "event_day")]
-
-
-@dataclass
-class ColumnStats:
-    min: Any
-    max: Any
-    null_count: int | None
-    num_rows: int
-
-
-@dataclass
-class RowGroupIndex:
-    stats: dict[str, ColumnStats]
-    values: dict[str, set[Any]]
-    has_null: dict[str, bool]
-    has_nan: dict[str, bool]
-    pair_values: dict[str, set[tuple[Any, Any]]]
 
 
 def _normalize(v: Any) -> Any:
@@ -64,66 +40,27 @@ def _load_queries() -> list[dict[str, Any]]:
         return json.load(f)
 
 
-def _extract_stats(rg_meta: pq.RowGroupMetaData) -> dict[str, ColumnStats]:
-    out: dict[str, ColumnStats] = {}
-    for ci in range(rg_meta.num_columns):
-        cmeta = rg_meta.column(ci)
-        s = cmeta.statistics
-        if s is None:
-            out[cmeta.path_in_schema] = ColumnStats(None, None, None, rg_meta.num_rows)
-        else:
-            out[cmeta.path_in_schema] = ColumnStats(
-                s.min if s.has_min_max else None,
-                s.max if s.has_min_max else None,
-                s.null_count,
-                rg_meta.num_rows,
-            )
-    return out
-
-
-def _build_row_group_index(pf: pq.ParquetFile) -> list[RowGroupIndex]:
-    index: list[RowGroupIndex] = []
-    for rg_idx in range(pf.metadata.num_row_groups):
-        rg_meta = pf.metadata.row_group(rg_idx)
-        table = pf.read_row_group(rg_idx)
-
-        values: dict[str, set[Any]] = {}
-        has_null: dict[str, bool] = {}
-        has_nan: dict[str, bool] = {}
-
-        for col_name in table.column_names:
-            col = table.column(col_name)
-            has_null[col_name] = col.null_count > 0
-
-            if pa.types.is_floating(col.type):
-                py_values = col.to_pylist()
-                has_nan[col_name] = any(isinstance(v, float) and math.isnan(v) for v in py_values if v is not None)
-
-            if pa.types.is_string(col.type) or pa.types.is_integer(col.type):
-                values[col_name] = set(col.drop_null().to_pylist())
-
-        pair_values: dict[str, set[tuple[Any, Any]]] = {}
-        for left, right in PAIR_INDEX_COLUMNS:
-            if left in table.column_names and right in table.column_names:
-                left_vals = table.column(left).to_pylist()
-                right_vals = table.column(right).to_pylist()
-                pair_values[f"{left}|{right}"] = {(a, b) for a, b in zip(left_vals, right_vals)}
-
-        index.append(
-            RowGroupIndex(
-                stats=_extract_stats(rg_meta),
-                values=values,
-                has_null=has_null,
-                has_nan=has_nan,
-                pair_values=pair_values,
-            )
-        )
-    return index
+def _columns_in_predicate(node: dict[str, Any] | None, output: set[str]) -> None:
+    if node is None:
+        return
+    node_type = node["type"]
+    if node_type in {"cmp", "in", "is_null", "is_not_null"}:
+        output.add(node["column"])
+        return
+    if node_type in {"and", "or"}:
+        for child in node["children"]:
+            _columns_in_predicate(child, output)
+        return
+    if node_type == "not":
+        _columns_in_predicate(node["child"], output)
+        return
+    raise ValueError(f"unsupported predicate node type: {node_type}")
 
 
 def _build_mask(table: pa.Table, node: dict[str, Any]) -> pa.Array:
-    t = node["type"]
-    if t == "cmp":
+    node_type = node["type"]
+
+    if node_type == "cmp":
         col = table.column(node["column"])
         op = node["op"]
         value = _coerce_scalar(node["value"], col.type)
@@ -139,30 +76,37 @@ def _build_mask(table: pa.Table, node: dict[str, Any]) -> pa.Array:
             return pc.greater(col, value)
         if op == "ge":
             return pc.greater_equal(col, value)
-        raise ValueError(f"Unsupported cmp op: {op}")
-    if t == "in":
+        raise ValueError(f"unsupported cmp op: {op}")
+
+    if node_type == "in":
         col = table.column(node["column"])
         values = [_coerce_scalar(v, col.type) for v in node["values"]]
         return pc.is_in(col, value_set=pa.array(values, type=col.type))
-    if t == "is_null":
+
+    if node_type == "is_null":
         return pc.is_null(table.column(node["column"]))
-    if t == "is_not_null":
+
+    if node_type == "is_not_null":
         return pc.is_valid(table.column(node["column"]))
-    if t == "and":
-        masks = [_build_mask(table, c) for c in node["children"]]
+
+    if node_type == "and":
+        masks = [_build_mask(table, child) for child in node["children"]]
         out = masks[0]
-        for m in masks[1:]:
-            out = pc.and_(out, m)
+        for mask in masks[1:]:
+            out = pc.and_(out, mask)
         return out
-    if t == "or":
-        masks = [_build_mask(table, c) for c in node["children"]]
+
+    if node_type == "or":
+        masks = [_build_mask(table, child) for child in node["children"]]
         out = masks[0]
-        for m in masks[1:]:
-            out = pc.or_(out, m)
+        for mask in masks[1:]:
+            out = pc.or_(out, mask)
         return out
-    if t == "not":
+
+    if node_type == "not":
         return pc.invert(_build_mask(table, node["child"]))
-    raise ValueError(f"Unsupported predicate node type: {t}")
+
+    raise ValueError(f"unsupported predicate node type: {node_type}")
 
 
 def _apply_predicate(table: pa.Table, predicate: dict[str, Any] | None) -> pa.Table:
@@ -171,144 +115,77 @@ def _apply_predicate(table: pa.Table, predicate: dict[str, Any] | None) -> pa.Ta
     return table.filter(_build_mask(table, predicate))
 
 
-def _columns_in_predicate(node: dict[str, Any] | None, output: set[str]) -> None:
-    if not node:
-        return
-    t = node["type"]
-    if t in {"cmp", "in", "is_null", "is_not_null"}:
-        output.add(node["column"])
-        return
-    if t in {"and", "or"}:
-        for child in node["children"]:
-            _columns_in_predicate(child, output)
-        return
-    if t == "not":
-        _columns_in_predicate(node["child"], output)
-        return
-    raise ValueError(f"Unsupported node type: {t}")
+def _build_index(parquet_file: pq.ParquetFile) -> dict[str, Any]:
+    row_groups: list[dict[str, Any]] = []
+
+    for row_group_index in range(parquet_file.metadata.num_row_groups):
+        rg_meta = parquet_file.metadata.row_group(row_group_index)
+        table = parquet_file.read_row_group(row_group_index)
+        columns: dict[str, Any] = {}
+
+        for field in parquet_file.schema_arrow:
+            column = table.column(field.name)
+            col_meta = None
+            for col_idx in range(rg_meta.num_columns):
+                probe = rg_meta.column(col_idx)
+                if probe.path_in_schema == field.name:
+                    col_meta = probe
+                    break
+            if col_meta is None:
+                raise RuntimeError(f"missing column metadata for {field.name}")
+            stats = col_meta.statistics
+            distinct_values = None
+            if pa.types.is_string(field.type) or pa.types.is_integer(field.type):
+                distinct_values = sorted({_normalize(v) for v in column.drop_null().to_pylist()}, key=repr)
+            columns[field.name] = {
+                "min": _normalize(stats.min) if stats is not None and stats.has_min_max else None,
+                "max": _normalize(stats.max) if stats is not None and stats.has_min_max else None,
+                "null_count": int(column.null_count),
+                "distinct_values": distinct_values,
+                "has_nan": pa.types.is_floating(field.type)
+                and any(isinstance(v, float) and math.isnan(v) for v in column.to_pylist() if v is not None),
+            }
+
+        pair_distinct_values: dict[str, list[list[Any]]] = {}
+        for left, right in PAIR_INDEX_COLUMNS:
+            pairs = sorted(
+                {(_normalize(a), _normalize(b)) for a, b in zip(table.column(left).to_pylist(), table.column(right).to_pylist())},
+                key=repr,
+            )
+            pair_distinct_values[f"{left}|{right}"] = [[left_value, right_value] for left_value, right_value in pairs]
+
+        row_groups.append(
+            {
+                "row_group": row_group_index,
+                "num_rows": rg_meta.num_rows,
+                "columns": columns,
+                "pair_distinct_values": pair_distinct_values,
+            }
+        )
+
+    return {
+        "format": "row-group-index-v1",
+        "parquet_file": "sales.parquet",
+        "row_groups": row_groups,
+    }
 
 
-def _nonnull_only(st: ColumnStats) -> bool:
-    return st.null_count == 0
-
-
-def _all_nulls(st: ColumnStats) -> bool:
-    return st.null_count is not None and st.null_count >= st.num_rows > 0
-
-
-def _coerce_for_stats_value(st: ColumnStats, value: Any) -> Any:
-    probe = st.min if st.min is not None else st.max
-    if isinstance(probe, Decimal):
+def _decode_bound(value: Any, dtype: pa.DataType) -> Any:
+    if value is None:
+        return None
+    if pa.types.is_decimal(dtype):
         return Decimal(str(value))
-    if isinstance(probe, datetime) and isinstance(value, str):
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if pa.types.is_timestamp(dtype):
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     return value
 
 
-def _cmp_may_true(rg: RowGroupIndex, column: str, op: str, value: Any) -> bool:
-    st = rg.stats.get(column, ColumnStats(None, None, None, 0))
-    value = _coerce_for_stats_value(st, value)
-    if _all_nulls(st):
-        return False
-
-    cv = rg.values.get(column)
-    has_nan = rg.has_nan.get(column, False)
-
-    if op == "eq" and cv is not None and value not in cv:
-        return False
-
-    if op == "ne":
-        if has_nan:
-            return True
-        if cv is not None and len(cv) == 1 and value in cv and _nonnull_only(st):
-            return False
-
-    rg_min, rg_max = st.min, st.max
-    if rg_min is None or rg_max is None:
-        return True
-
-    if op == "eq":
-        return not (value < rg_min or value > rg_max)
-    if op == "ne":
-        if rg_min == rg_max == value and _nonnull_only(st) and not has_nan:
-            return False
-        return True
-    if op == "lt":
-        return rg_min < value
-    if op == "le":
-        return rg_min <= value
-    if op == "gt":
-        return rg_max > value
-    if op == "ge":
-        return rg_max >= value
-    return True
+def _nonnull_only(summary: dict[str, Any]) -> bool:
+    return summary["null_count"] == 0
 
 
-def _in_may_true(rg: RowGroupIndex, column: str, values: list[Any]) -> bool:
-    st = rg.stats.get(column, ColumnStats(None, None, None, 0))
-    allowed_values = [_coerce_for_stats_value(st, v) for v in values]
-    if _all_nulls(st):
-        return False
-
-    allowed = set(allowed_values)
-    cv = rg.values.get(column)
-    if cv is not None and cv.isdisjoint(allowed):
-        return False
-
-    rg_min, rg_max = st.min, st.max
-    if rg_min is not None and rg_max is not None and all(v < rg_min or v > rg_max for v in allowed):
-        return False
-    return True
-
-
-def _leaf_always_true(rg: RowGroupIndex, node: dict[str, Any]) -> bool:
-    col = node["column"]
-    st = rg.stats.get(col, ColumnStats(None, None, None, 0))
-    t = node["type"]
-    has_nan = rg.has_nan.get(col, False)
-
-    if t == "is_null":
-        return st.null_count is not None and st.null_count == st.num_rows
-
-    if t == "is_not_null":
-        return st.null_count == 0
-
-    if t == "in":
-        allowed_values = [_coerce_for_stats_value(st, v) for v in node["values"]]
-        if not _nonnull_only(st):
-            return False
-        cv = rg.values.get(col)
-        return cv is not None and cv.issubset(set(allowed_values)) and len(cv) > 0
-
-    if t == "cmp":
-        if not _nonnull_only(st):
-            return False
-        op, value = node["op"], _coerce_for_stats_value(st, node["value"])
-        rg_min, rg_max = st.min, st.max
-        if rg_min is None or rg_max is None:
-            return False
-
-        cv = rg.values.get(col)
-        if op == "eq":
-            if has_nan:
-                return False
-            return (cv == {value}) if cv is not None else (rg_min == rg_max == value)
-        if op == "ne":
-            if has_nan:
-                return True
-            return (value not in cv) if cv is not None else (value < rg_min or value > rg_max)
-        if op in {"lt", "le", "gt", "ge"} and has_nan:
-            return False
-        if op == "lt":
-            return rg_max < value
-        if op == "le":
-            return rg_max <= value
-        if op == "gt":
-            return rg_min > value
-        if op == "ge":
-            return rg_min >= value
-
-    return False
+def _all_nulls(summary: dict[str, Any], num_rows: int) -> bool:
+    return summary["null_count"] >= num_rows > 0
 
 
 def _flatten_and(node: dict[str, Any]) -> list[dict[str, Any]]:
@@ -320,120 +197,191 @@ def _flatten_and(node: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
-def _allowed_sets_for_and(node: dict[str, Any]) -> dict[str, set[Any]]:
+def _allowed_sets_for_and(row_group_entry: dict[str, Any], schema: dict[str, pa.DataType], node: dict[str, Any]) -> dict[str, set[Any]]:
+    del row_group_entry
     allowed: dict[str, set[Any]] = {}
     for leaf in _flatten_and(node):
-        t = leaf["type"]
-        if t == "cmp" and leaf["op"] == "eq":
-            vals = {leaf["value"]}
-        elif t == "in":
-            vals = set(leaf["values"])
-        elif t == "is_null":
-            vals = {None}
+        leaf_type = leaf["type"]
+        column = leaf.get("column")
+        if column is None:
+            continue
+        dtype = schema[column]
+        if leaf_type == "cmp" and leaf["op"] == "eq":
+            values = {_normalize(_coerce_scalar(leaf["value"], dtype))}
+        elif leaf_type == "in":
+            values = {_normalize(_coerce_scalar(value, dtype)) for value in leaf["values"]}
+        elif leaf_type == "is_null":
+            values = {None}
         else:
             continue
-
-        col = leaf["column"]
-        if col in allowed:
-            allowed[col] &= vals
+        if column in allowed:
+            allowed[column] &= values
         else:
-            allowed[col] = set(vals)
+            allowed[column] = set(values)
     return allowed
 
 
-def _pair_feasible(rg: RowGroupIndex, node: dict[str, Any]) -> bool:
+def _pair_feasible(row_group_entry: dict[str, Any], schema: dict[str, pa.DataType], node: dict[str, Any]) -> bool:
     if node["type"] != "and":
         return True
-    allowed = _allowed_sets_for_and(node)
-
-    for left, right in PAIR_INDEX_COLUMNS:
+    allowed = _allowed_sets_for_and(row_group_entry, schema, node)
+    for pair_key, pairs in row_group_entry["pair_distinct_values"].items():
+        left, right = pair_key.split("|", 1)
         if left not in allowed or right not in allowed:
             continue
-        pair_set = rg.pair_values.get(f"{left}|{right}")
-        if pair_set is None:
-            continue
-        if not any((a, b) in pair_set for a in allowed[left] for b in allowed[right]):
+        exact_pairs = {tuple(pair) for pair in pairs}
+        if not any((left_value, right_value) in exact_pairs for left_value in allowed[left] for right_value in allowed[right]):
             return False
-
     return True
 
 
-def _may_be_false(rg: RowGroupIndex, node: dict[str, Any]) -> bool:
-    t = node["type"]
-    if t == "and":
-        return any(_may_be_false(rg, c) for c in node["children"])
-    if t == "or":
-        return all(_may_be_false(rg, c) for c in node["children"])
-    if t == "not":
-        return _may_be_true(rg, node["child"])
-    return not _leaf_always_true(rg, node)
+def _leaf_always_true(row_group_entry: dict[str, Any], schema: dict[str, pa.DataType], node: dict[str, Any]) -> bool:
+    column = node["column"]
+    summary = row_group_entry["columns"][column]
+    dtype = schema[column]
+    num_rows = row_group_entry["num_rows"]
+    distinct_values = summary["distinct_values"]
+    has_nan = summary["has_nan"]
+    node_type = node["type"]
 
-
-def _may_be_true(rg: RowGroupIndex, node: dict[str, Any]) -> bool:
-    t = node["type"]
-    if t == "and":
-        if not all(_may_be_true(rg, c) for c in node["children"]):
+    if node_type == "is_null":
+        return summary["null_count"] == num_rows
+    if node_type == "is_not_null":
+        return summary["null_count"] == 0
+    if node_type == "in":
+        if not _nonnull_only(summary) or distinct_values is None:
             return False
-        return _pair_feasible(rg, node)
-    if t == "or":
-        return any(_may_be_true(rg, c) for c in node["children"])
-    if t == "not":
-        return _may_be_false(rg, node["child"])
-    if t == "cmp":
-        return _cmp_may_true(rg, node["column"], node["op"], node["value"])
-    if t == "in":
-        return _in_may_true(rg, node["column"], node["values"])
-    if t == "is_null":
-        st = rg.stats.get(node["column"], ColumnStats(None, None, None, 0))
-        if st.null_count is not None:
-            return st.null_count > 0
-        return rg.has_null.get(node["column"], True)
-    if t == "is_not_null":
-        st = rg.stats.get(node["column"], ColumnStats(None, None, None, 0))
-        if st.null_count is not None:
-            return st.null_count < st.num_rows
-        return True
-    return True
+        allowed = {_normalize(_coerce_scalar(value, dtype)) for value in node["values"]}
+        return set(distinct_values).issubset(allowed) and len(distinct_values) > 0
+    if node_type != "cmp":
+        return False
 
+    exact_value = _normalize(_coerce_scalar(node["value"], dtype))
+    typed_value = _coerce_scalar(node["value"], dtype)
+    min_value = _decode_bound(summary["min"], dtype)
+    max_value = _decode_bound(summary["max"], dtype)
+    op = node["op"]
 
-def _receipt_for_table(table: pa.Table) -> str:
-    h = hashlib.blake2b(digest_size=16)
-    h.update(f"rows={table.num_rows}".encode("utf-8"))
-    for row in table.to_pylist():
-        payload = json.dumps({k: _normalize(v) for k, v in row.items()}, sort_keys=True, separators=(",", ":"))
-        h.update(payload.encode("utf-8"))
-        h.update(b"\n")
-    return h.hexdigest()
-
-
-def _query_receipt(query_id: str, read_row_groups: list[dict[str, Any]]) -> str:
-    h = hashlib.blake2b(digest_size=16)
-    h.update(query_id.encode("utf-8"))
-    h.update(b"|")
-    for entry in read_row_groups:
-        h.update(
-            f"{entry['row_group']}:{entry['decoded_rows']}:{entry['decoded_bytes']}:{entry['receipt']}".encode("utf-8")
+    if not _nonnull_only(summary):
+        return False
+    if op == "eq":
+        if has_nan:
+            return False
+        return distinct_values == [exact_value] if distinct_values is not None else min_value == max_value == typed_value
+    if op == "ne":
+        if has_nan:
+            return True
+        return exact_value not in distinct_values if distinct_values is not None else (
+            min_value is not None and max_value is not None and (typed_value < min_value or typed_value > max_value)
         )
-        h.update(b"|")
-    return h.hexdigest()
+    if min_value is None or max_value is None or has_nan:
+        return False
+    if op == "lt":
+        return max_value < typed_value
+    if op == "le":
+        return max_value <= typed_value
+    if op == "gt":
+        return min_value > typed_value
+    if op == "ge":
+        return min_value >= typed_value
+    return False
 
 
-def _find_parquet() -> str:
-    import glob as _glob
-    matches = _glob.glob(os.path.join(DATA_DIR, "*.parquet"))
-    if not matches:
-        raise RuntimeError(f"No parquet file found in {DATA_DIR}")
-    return sorted(matches)[0]
+def _cmp_may_true(row_group_entry: dict[str, Any], schema: dict[str, pa.DataType], column: str, op: str, value: Any) -> bool:
+    summary = row_group_entry["columns"][column]
+    dtype = schema[column]
+    num_rows = row_group_entry["num_rows"]
+    exact_value = _normalize(_coerce_scalar(value, dtype))
+    typed_value = _coerce_scalar(value, dtype)
+    min_value = _decode_bound(summary["min"], dtype)
+    max_value = _decode_bound(summary["max"], dtype)
+    distinct_values = summary["distinct_values"]
+    has_nan = summary["has_nan"]
+
+    if _all_nulls(summary, num_rows):
+        return False
+    if op == "eq" and distinct_values is not None and exact_value not in distinct_values:
+        return False
+    if op == "ne":
+        if has_nan:
+            return True
+        if distinct_values is not None and distinct_values == [exact_value] and _nonnull_only(summary):
+            return False
+    if min_value is None or max_value is None:
+        return True
+    if op == "eq":
+        return not (typed_value < min_value or typed_value > max_value)
+    if op == "ne":
+        return not (min_value == max_value == typed_value and _nonnull_only(summary) and not has_nan)
+    if op == "lt":
+        return min_value < typed_value
+    if op == "le":
+        return min_value <= typed_value
+    if op == "gt":
+        return max_value > typed_value
+    if op == "ge":
+        return max_value >= typed_value
+    return True
+
+
+def _in_may_true(row_group_entry: dict[str, Any], schema: dict[str, pa.DataType], column: str, values: list[Any]) -> bool:
+    summary = row_group_entry["columns"][column]
+    dtype = schema[column]
+    num_rows = row_group_entry["num_rows"]
+    canonical_values = {_normalize(_coerce_scalar(value, dtype)) for value in values}
+    typed_values = [_coerce_scalar(value, dtype) for value in values]
+    distinct_values = summary["distinct_values"]
+    min_value = _decode_bound(summary["min"], dtype)
+    max_value = _decode_bound(summary["max"], dtype)
+
+    if _all_nulls(summary, num_rows):
+        return False
+    if distinct_values is not None and set(distinct_values).isdisjoint(canonical_values):
+        return False
+    if min_value is not None and max_value is not None and all(value < min_value or value > max_value for value in typed_values):
+        return False
+    return True
+
+
+def _may_be_false(row_group_entry: dict[str, Any], schema: dict[str, pa.DataType], node: dict[str, Any]) -> bool:
+    node_type = node["type"]
+    if node_type == "and":
+        return any(_may_be_false(row_group_entry, schema, child) for child in node["children"])
+    if node_type == "or":
+        return all(_may_be_false(row_group_entry, schema, child) for child in node["children"])
+    if node_type == "not":
+        return _may_be_true(row_group_entry, schema, node["child"])
+    return not _leaf_always_true(row_group_entry, schema, node)
+
+
+def _may_be_true(row_group_entry: dict[str, Any], schema: dict[str, pa.DataType], predicate: dict[str, Any] | None) -> bool:
+    if predicate is None:
+        return True
+    node_type = predicate["type"]
+    if node_type == "and":
+        if not all(_may_be_true(row_group_entry, schema, child) for child in predicate["children"]):
+            return False
+        return _pair_feasible(row_group_entry, schema, predicate)
+    if node_type == "or":
+        return any(_may_be_true(row_group_entry, schema, child) for child in predicate["children"])
+    if node_type == "not":
+        return _may_be_false(row_group_entry, schema, predicate["child"])
+    if node_type == "cmp":
+        return _cmp_may_true(row_group_entry, schema, predicate["column"], predicate["op"], predicate["value"])
+    if node_type == "in":
+        return _in_may_true(row_group_entry, schema, predicate["column"], predicate["values"])
+    if node_type == "is_null":
+        return row_group_entry["columns"][predicate["column"]]["null_count"] > 0
+    if node_type == "is_not_null":
+        return row_group_entry["columns"][predicate["column"]]["null_count"] < row_group_entry["num_rows"]
+    raise ValueError(f"unsupported predicate node type: {node_type}")
 
 
 def build_index() -> None:
-    parquet_path = _find_parquet()
-    pf = pq.ParquetFile(parquet_path)
-    rg_index = _build_row_group_index(pf)
-
-    with open(INDEX_PATH, "wb") as f:
-        pickle.dump({"parquet": os.path.basename(parquet_path), "num_row_groups": pf.metadata.num_row_groups, "index": rg_index}, f)
-
+    parquet_file = pq.ParquetFile(os.path.join(DATA_DIR, "sales.parquet"))
+    payload = _build_index(parquet_file)
+    with open(INDEX_PATH, "w", encoding="utf-8") as f:
+        json.dump(payload, f, sort_keys=True, separators=(",", ":"))
     print(f"Wrote {INDEX_PATH}")
 
 
@@ -443,73 +391,33 @@ def run_query_pass() -> None:
 
     queries = _load_queries()
     if not queries:
-        raise RuntimeError("No queries available")
+        raise RuntimeError("No visible queries available")
 
-    with open(INDEX_PATH, "rb") as f:
-        payload = pickle.load(f)
-    rg_index: list[RowGroupIndex] = payload["index"]
-    pf = pq.ParquetFile(os.path.join(DATA_DIR, payload["parquet"]))
+    parquet_file = pq.ParquetFile(os.path.join(DATA_DIR, "sales.parquet"))
+    schema = {field.name: field.type for field in parquet_file.schema_arrow}
+    with open(INDEX_PATH, encoding="utf-8") as f:
+        index_payload = json.load(f)
 
-    results_payload: list[dict[str, Any]] = []
-    trace_records: list[dict[str, Any]] = []
-
-    query_phase_start = perf_counter()
+    all_results: list[dict[str, Any]] = []
     for query in queries:
         predicate = query.get("predicate")
         projection = query["columns"]
-
-        required_columns = set(projection)
-        _columns_in_predicate(predicate, required_columns)
-        read_columns = sorted(required_columns)
+        read_columns = set(projection)
+        _columns_in_predicate(predicate, read_columns)
 
         rows: list[dict[str, Any]] = []
-        read_trace: list[dict[str, Any]] = []
-
-        for rg_idx in range(pf.metadata.num_row_groups):
-            if predicate is not None and not _may_be_true(rg_index[rg_idx], predicate):
+        for entry in index_payload["row_groups"]:
+            if not _may_be_true(entry, schema, predicate):
                 continue
-
-            decoded = pf.read_row_group(rg_idx, columns=read_columns)
-            receipt = _receipt_for_table(decoded)
-            decoded_bytes = decoded.nbytes
-
+            decoded = parquet_file.read_row_group(entry["row_group"], columns=sorted(read_columns))
             filtered = _apply_predicate(decoded, predicate)
-            projected = filtered.select(projection)
-            rows.extend({k: _normalize(v) for k, v in row.items()} for row in projected.to_pylist())
+            rows.extend({k: _normalize(v) for k, v in row.items()} for row in filtered.select(projection).to_pylist())
 
-            read_trace.append(
-                {
-                    "row_group": rg_idx,
-                    "decoded_rows": decoded.num_rows,
-                    "decoded_bytes": decoded_bytes,
-                    "receipt": receipt,
-                }
-            )
-
-        trace_record = {
-            "query_id": query["id"],
-            "read_row_groups": read_trace,
-            "query_receipt": _query_receipt(query["id"], read_trace),
-            "result_count": len(rows),
-        }
-
-        results_payload.append({"query_id": query["id"], "rows": rows})
-        trace_records.append(trace_record)
-
-    elapsed_ms = int((perf_counter() - query_phase_start) * 1000)
+        all_results.append({"query_id": query["id"], "rows": rows})
 
     with open(RESULTS_PATH, "w", encoding="utf-8") as f:
-        json.dump(results_payload, f, indent=2)
-
-    with open(TRACE_PATH, "w", encoding="utf-8") as f:
-        for record in trace_records:
-            f.write(json.dumps(record) + "\n")
-
-    with open(METRICS_PATH, "w", encoding="utf-8") as f:
-        json.dump({"query_pass_elapsed_ms": elapsed_ms}, f, indent=2)
-
-    print(f"Wrote {RESULTS_PATH} and {TRACE_PATH}")
-    print(f"Query pass elapsed: {elapsed_ms} ms")
+        json.dump(all_results, f, indent=2)
+    print(f"Wrote {RESULTS_PATH}")
 
 
 def main() -> None:

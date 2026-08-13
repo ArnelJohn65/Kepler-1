@@ -1,17 +1,15 @@
 """
 Baseline engine scaffold with two-pass execution.
 
-build: may scan all row groups and persist any index files.
-query: must load persisted index and produce /app/results.json and /app/trace.jsonl.
+build: scan every row group once and persist a plain-data JSON index.
+query: load that index, scan visible queries, and write /app/results.json.
 
 This baseline intentionally does no pruning in query mode.
 """
 
-import hashlib
 import json
 import math
 import os
-import pickle
 import sys
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -24,8 +22,8 @@ import pyarrow.parquet as pq
 APP_ROOT = os.environ.get("APP_ROOT", "/app")
 DATA_DIR = os.path.join(APP_ROOT, "data")
 RESULTS_PATH = os.path.join(APP_ROOT, "results.json")
-TRACE_PATH = os.path.join(APP_ROOT, "trace.jsonl")
-INDEX_PATH = os.path.join(APP_ROOT, "row_group_index.pkl")
+INDEX_PATH = os.path.join(APP_ROOT, "row_group_index.json")
+PAIR_INDEX_COLUMNS = [("segment", "status"), ("region", "channel"), ("sku", "event_day")]
 
 
 def _normalize(v: Any) -> Any:
@@ -51,57 +49,65 @@ def _load_queries() -> list[dict[str, Any]]:
         return json.load(f)
 
 
-def _columns_in_predicate(node: dict[str, Any] | None, out: set[str]) -> None:
+def _columns_in_predicate(node: dict[str, Any] | None, output: set[str]) -> None:
     if node is None:
         return
-    t = node["type"]
-    if t in {"cmp", "in", "is_null", "is_not_null"}:
-        out.add(node["column"])
-    elif t in {"and", "or"}:
-        for c in node["children"]:
-            _columns_in_predicate(c, out)
-    elif t == "not":
-        _columns_in_predicate(node["child"], out)
+    node_type = node["type"]
+    if node_type in {"cmp", "in", "is_null", "is_not_null"}:
+        output.add(node["column"])
+        return
+    if node_type in {"and", "or"}:
+        for child in node["children"]:
+            _columns_in_predicate(child, output)
+        return
+    if node_type == "not":
+        _columns_in_predicate(node["child"], output)
+        return
+    raise ValueError(f"unsupported predicate node type: {node_type}")
 
 
 def _build_mask(table: pa.Table, node: dict[str, Any]) -> pa.Array:
-    t = node["type"]
-    if t == "cmp":
+    node_type = node["type"]
+    if node_type == "cmp":
         col = table.column(node["column"])
+        value = _coerce_scalar(node["value"], col.type)
         op = node["op"]
-        val = _coerce_scalar(node["value"], col.type)
-        ops = {
-            "eq": pc.equal,
-            "ne": pc.not_equal,
-            "lt": pc.less,
-            "le": pc.less_equal,
-            "gt": pc.greater,
-            "ge": pc.greater_equal,
-        }
-        return ops[op](col, val)
-    if t == "in":
+        if op == "eq":
+            return pc.equal(col, value)
+        if op == "ne":
+            return pc.not_equal(col, value)
+        if op == "lt":
+            return pc.less(col, value)
+        if op == "le":
+            return pc.less_equal(col, value)
+        if op == "gt":
+            return pc.greater(col, value)
+        if op == "ge":
+            return pc.greater_equal(col, value)
+        raise ValueError(f"unsupported cmp op: {op}")
+    if node_type == "in":
         col = table.column(node["column"])
         values = [_coerce_scalar(v, col.type) for v in node["values"]]
         return pc.is_in(col, value_set=pa.array(values, type=col.type))
-    if t == "is_null":
+    if node_type == "is_null":
         return pc.is_null(table.column(node["column"]))
-    if t == "is_not_null":
+    if node_type == "is_not_null":
         return pc.is_valid(table.column(node["column"]))
-    if t == "and":
-        masks = [_build_mask(table, c) for c in node["children"]]
+    if node_type == "and":
+        masks = [_build_mask(table, child) for child in node["children"]]
         out = masks[0]
-        for m in masks[1:]:
-            out = pc.and_(out, m)
+        for mask in masks[1:]:
+            out = pc.and_(out, mask)
         return out
-    if t == "or":
-        masks = [_build_mask(table, c) for c in node["children"]]
+    if node_type == "or":
+        masks = [_build_mask(table, child) for child in node["children"]]
         out = masks[0]
-        for m in masks[1:]:
-            out = pc.or_(out, m)
+        for mask in masks[1:]:
+            out = pc.or_(out, mask)
         return out
-    if t == "not":
+    if node_type == "not":
         return pc.invert(_build_mask(table, node["child"]))
-    raise ValueError(f"unknown predicate type: {t}")
+    raise ValueError(f"unsupported predicate node type: {node_type}")
 
 
 def _apply_predicate(table: pa.Table, predicate: dict[str, Any] | None) -> pa.Table:
@@ -110,100 +116,79 @@ def _apply_predicate(table: pa.Table, predicate: dict[str, Any] | None) -> pa.Ta
     return table.filter(_build_mask(table, predicate))
 
 
-def _receipt(table: pa.Table) -> str:
-    h = hashlib.blake2b(digest_size=16)
-    h.update(f"rows={table.num_rows}".encode("utf-8"))
-    for row in table.to_pylist():
-        payload = json.dumps({k: _normalize(v) for k, v in row.items()}, sort_keys=True, separators=(",", ":"))
-        h.update(payload.encode("utf-8"))
-        h.update(b"\n")
-    return h.hexdigest()
-
-
-def _query_receipt(query_id: str, read_row_groups: list[dict[str, Any]]) -> str:
-    h = hashlib.blake2b(digest_size=16)
-    h.update(query_id.encode("utf-8"))
-    h.update(b"|")
-    for e in read_row_groups:
-        h.update(f"{e['row_group']}:{e['decoded_rows']}:{e['decoded_bytes']}:{e['receipt']}".encode("utf-8"))
-        h.update(b"|")
-    return h.hexdigest()
-
-
 def build_index() -> None:
-    import glob as _glob
-    matches = _glob.glob(os.path.join(DATA_DIR, "*.parquet"))
-    if not matches:
-        raise RuntimeError(f"No parquet file found in {DATA_DIR}")
-    parquet_path = sorted(matches)[0]
-    pf = pq.ParquetFile(parquet_path)
+    parquet_file = pq.ParquetFile(os.path.join(DATA_DIR, "sales.parquet"))
+    row_groups: list[dict[str, Any]] = []
+    for row_group_index in range(parquet_file.metadata.num_row_groups):
+        rg_meta = parquet_file.metadata.row_group(row_group_index)
+        table = parquet_file.read_row_group(row_group_index)
+        columns: dict[str, Any] = {}
+        for field in parquet_file.schema_arrow:
+            column = table.column(field.name)
+            col_meta = None
+            for col_idx in range(rg_meta.num_columns):
+                probe = rg_meta.column(col_idx)
+                if probe.path_in_schema == field.name:
+                    col_meta = probe
+                    break
+            if col_meta is None:
+                raise RuntimeError(f"missing column metadata for {field.name}")
+            stats = col_meta.statistics
+            distinct_values = None
+            if pa.types.is_string(field.type) or pa.types.is_integer(field.type):
+                distinct_values = sorted({_normalize(v) for v in column.drop_null().to_pylist()}, key=repr)
+            columns[field.name] = {
+                "min": _normalize(stats.min) if stats is not None and stats.has_min_max else None,
+                "max": _normalize(stats.max) if stats is not None and stats.has_min_max else None,
+                "null_count": int(column.null_count),
+                "distinct_values": distinct_values,
+                "has_nan": pa.types.is_floating(field.type)
+                and any(isinstance(v, float) and math.isnan(v) for v in column.to_pylist() if v is not None),
+            }
+        pair_distinct_values: dict[str, list[list[Any]]] = {}
+        for left, right in PAIR_INDEX_COLUMNS:
+            pairs = sorted(
+                {(_normalize(a), _normalize(b)) for a, b in zip(table.column(left).to_pylist(), table.column(right).to_pylist())},
+                key=repr,
+            )
+            pair_distinct_values[f"{left}|{right}"] = [[left_value, right_value] for left_value, right_value in pairs]
+        row_groups.append(
+            {
+                "row_group": row_group_index,
+                "num_rows": rg_meta.num_rows,
+                "columns": columns,
+                "pair_distinct_values": pair_distinct_values,
+            }
+        )
 
-    # Baseline placeholder index: only row counts and stat presence.
-    stats = []
-    for rg_idx in range(pf.metadata.num_row_groups):
-        rg = pf.metadata.row_group(rg_idx)
-        stats.append({"row_group": rg_idx, "num_rows": rg.num_rows, "num_columns": rg.num_columns})
-
-    with open(INDEX_PATH, "wb") as f:
-        pickle.dump({"parquet": os.path.basename(parquet_path), "row_groups": stats}, f)
-
+    with open(INDEX_PATH, "w", encoding="utf-8") as f:
+        json.dump({"format": "row-group-index-v1", "parquet_file": "sales.parquet", "row_groups": row_groups}, f)
     print(f"Wrote {INDEX_PATH}")
 
 
 def run_queries() -> None:
-    if not os.path.exists(INDEX_PATH):
-        raise RuntimeError(f"Missing build-pass index: {INDEX_PATH}")
-
     queries = _load_queries()
     if not queries:
-        raise RuntimeError("No queries available")
-    with open(INDEX_PATH, "rb") as f:
-        payload = pickle.load(f)
-    pf = pq.ParquetFile(os.path.join(DATA_DIR, payload["parquet"]))
+        raise RuntimeError("No visible queries available")
+    parquet_file = pq.ParquetFile(os.path.join(DATA_DIR, "sales.parquet"))
 
     all_results: list[dict[str, Any]] = []
-    all_traces: list[dict[str, Any]] = []
+    for query in queries:
+        predicate = query.get("predicate")
+        projection = query["columns"]
+        read_columns = set(projection)
+        _columns_in_predicate(predicate, read_columns)
 
-    for q in queries:
-        predicate = q.get("predicate")
-        proj = q["columns"]
-        required = set(proj)
-        _columns_in_predicate(predicate, required)
-        read_cols = sorted(required)
-
-        rows = []
-        read_trace = []
-        for rg in range(pf.metadata.num_row_groups):
-            decoded = pf.read_row_group(rg, columns=read_cols)
+        rows: list[dict[str, Any]] = []
+        for row_group_index in range(parquet_file.metadata.num_row_groups):
+            decoded = parquet_file.read_row_group(row_group_index, columns=sorted(read_columns))
             filtered = _apply_predicate(decoded, predicate)
-            rows.extend({k: _normalize(v) for k, v in row.items()} for row in filtered.select(proj).to_pylist())
-
-            read_trace.append(
-                {
-                    "row_group": rg,
-                    "decoded_rows": decoded.num_rows,
-                    "decoded_bytes": decoded.nbytes,
-                    "receipt": _receipt(decoded),
-                }
-            )
-
-        all_results.append({"query_id": q["id"], "rows": rows})
-        all_traces.append(
-            {
-                "query_id": q["id"],
-                "read_row_groups": read_trace,
-                "query_receipt": _query_receipt(q["id"], read_trace),
-                "result_count": len(rows),
-            }
-        )
+            rows.extend({k: _normalize(v) for k, v in row.items()} for row in filtered.select(projection).to_pylist())
+        all_results.append({"query_id": query["id"], "rows": rows})
 
     with open(RESULTS_PATH, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2)
-    with open(TRACE_PATH, "w", encoding="utf-8") as f:
-        for rec in all_traces:
-            f.write(json.dumps(rec) + "\n")
-
-    print(f"Wrote {RESULTS_PATH} and {TRACE_PATH}")
+    print(f"Wrote {RESULTS_PATH}")
 
 
 def main() -> None:

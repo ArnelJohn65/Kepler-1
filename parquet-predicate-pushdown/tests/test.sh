@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-EXPECTED_TESTS=50  # 2 session tests + 12 queries x 4 tests
+EXPECTED_TESTS=27  # 3 session tests + 12 visible queries + 12 hidden queries
 REWARD=0
 mkdir -p /logs/verifier
 

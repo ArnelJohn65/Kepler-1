@@ -7,7 +7,4 @@ WORKDIR /app
 COPY data/ /app/data/
 COPY engine/ /app/engine/
 
-# Generate data at build time
-RUN python /app/data/generate.py
-
 CMD ["bash"]

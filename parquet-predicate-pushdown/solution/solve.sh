@@ -3,25 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [ -z "${APP_ROOT:-}" ]; then
-  export APP_ROOT=/app
-fi
+export APP_ROOT="${APP_ROOT:-/app}"
 
-DATA_DIR="${APP_ROOT}/data"
-QUERIES_FILE="${DATA_DIR}/queries.json"
-QUERIES_HIDDEN="${QUERIES_FILE}.hidden"
-
-restore_queries() {
-  if [ -f "${QUERIES_HIDDEN}" ]; then
-    mv "${QUERIES_HIDDEN}" "${QUERIES_FILE}"
-  fi
-}
-
-trap restore_queries EXIT
-
-mv "${QUERIES_FILE}" "${QUERIES_HIDDEN}"
 python "${SCRIPT_DIR}/solve.py" build
-restore_queries
 python "${SCRIPT_DIR}/solve.py" query
-
-trap - EXIT
