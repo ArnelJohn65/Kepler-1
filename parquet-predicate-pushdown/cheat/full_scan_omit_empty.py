@@ -138,6 +138,8 @@ def main():
         rows = []
         read_trace = []
         for rg in range(pf.metadata.num_row_groups):
+            # This internal check mirrors the runner's hard timeout and intentionally
+            # aborts before artifact emission when the query-phase budget is missed.
             if perf_counter() - started > QUERY_TIMEOUT_SEC:
                 sys.exit(124)
             decoded = pf.read_row_group(rg, columns=read_cols)

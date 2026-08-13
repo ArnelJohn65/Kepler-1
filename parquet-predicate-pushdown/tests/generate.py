@@ -418,23 +418,22 @@ def finalize_query_budgets(parquet_path: str, queries: list[dict[str, Any]]) -> 
         read_columns = sorted(required)
 
         matching_groups = 0
-        matching_group_bytes: list[int] = []
+        all_group_bytes: list[int] = []
 
         for rg_idx in range(total_row_groups):
             decoded = pf.read_row_group(rg_idx, columns=read_columns)
+            all_group_bytes.append(decoded.nbytes)
             if _apply_predicate(decoded, predicate).num_rows > 0:
                 matching_groups += 1
-                matching_group_bytes.append(decoded.nbytes)
 
         assert matching_groups > 0, f"{query['id']} must have at least one matching row group"
-        max_group_bytes = max(matching_group_bytes)
 
         max_reads = matching_groups + int(query.pop("budget_slack"))
         assert max_reads < total_row_groups, f"{query['id']} max_row_groups_read must be less than total row groups"
         assert max_reads <= max(1, total_row_groups // 5), f"{query['id']} max_row_groups_read is too loose"
 
         query["max_row_groups_read"] = max_reads
-        query["max_decoded_bytes"] = max_reads * max_group_bytes
+        query["max_decoded_bytes"] = sum(sorted(all_group_bytes, reverse=True)[:max_reads])
 
     return queries
 
