@@ -6,8 +6,8 @@ import random
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-APP_ROOT = os.environ.get("APP_ROOT", "/app")
-OUT_DIR = os.path.join(APP_ROOT, "data")
+TESTS_ROOT = os.environ.get("TESTS_ROOT", "/tests")
+OUT_DIR = os.path.join(TESTS_ROOT, "data")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 RANDOM_SEED = 20260813
