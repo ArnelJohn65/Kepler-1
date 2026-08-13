@@ -197,8 +197,7 @@ def _flatten_and(node: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
-def _allowed_sets_for_and(row_group_entry: dict[str, Any], schema: dict[str, pa.DataType], node: dict[str, Any]) -> dict[str, set[Any]]:
-    del row_group_entry
+def _allowed_sets_for_and(schema: dict[str, pa.DataType], node: dict[str, Any]) -> dict[str, set[Any]]:
     allowed: dict[str, set[Any]] = {}
     for leaf in _flatten_and(node):
         leaf_type = leaf["type"]
@@ -224,7 +223,7 @@ def _allowed_sets_for_and(row_group_entry: dict[str, Any], schema: dict[str, pa.
 def _pair_feasible(row_group_entry: dict[str, Any], schema: dict[str, pa.DataType], node: dict[str, Any]) -> bool:
     if node["type"] != "and":
         return True
-    allowed = _allowed_sets_for_and(row_group_entry, schema, node)
+    allowed = _allowed_sets_for_and(schema, node)
     for pair_key, pairs in row_group_entry["pair_distinct_values"].items():
         left, right = pair_key.split("|", 1)
         if left not in allowed or right not in allowed:

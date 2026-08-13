@@ -126,18 +126,13 @@ def index_payload(parquet_file: pq.ParquetFile, schema_types: dict[str, pa.DataT
     return payload
 
 
-def test_generated_specs_exist() -> None:
-    assert os.path.exists(VISIBLE_QUERIES_PATH), f"missing verifier query spec: {VISIBLE_QUERIES_PATH}"
-    assert os.path.exists(HIDDEN_QUERIES_PATH), f"missing verifier hidden query spec: {HIDDEN_QUERIES_PATH}"
-
-
 def test_agent_artifacts_exist() -> None:
     assert os.path.exists(RESULTS_PATH), f"missing agent artifact: {RESULTS_PATH}"
     assert os.path.exists(INDEX_PATH), f"missing agent artifact: {INDEX_PATH}"
 
 
-def test_index_size_cap(index_payload: dict[str, Any]) -> None:
-    del index_payload
+def test_index_size_cap() -> None:
+    assert os.path.exists(INDEX_PATH), f"missing agent artifact: {INDEX_PATH}"
     size_bytes = os.path.getsize(INDEX_PATH)
     assert size_bytes <= INDEX_SIZE_CAP_BYTES, (
         f"row_group_index.json is too large: {size_bytes} bytes exceeds {INDEX_SIZE_CAP_BYTES}"
@@ -163,6 +158,7 @@ def test_visible_query_results_match_reference(
 
     actual = [canonicalize_row(row, schema_types) for row in results_by_id[visible_query_id]]
     expected = [canonicalize_row(row, schema_types) for row in expected_rows]
+    assert expected, f"visible query {visible_query_id} unexpectedly matches zero rows in the verifier dataset"
     assert actual == expected, f"visible query {visible_query_id} returned incorrect rows"
 
 

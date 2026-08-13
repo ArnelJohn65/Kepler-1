@@ -470,7 +470,7 @@ def build_hidden_queries() -> list[dict]:
     ]
 
 
-def add_precision_ceilings(parquet_path: str, hidden_queries: list[dict]) -> list[dict]:
+def add_precision_ceilings(parquet_path: str, hidden_queries: list[dict]) -> tuple[list[dict], int]:
     parquet_file = pq.ParquetFile(parquet_path)
     schema = {field.name: field.type for field in parquet_file.schema_arrow}
     index_payload = build_reference_index(parquet_file)
@@ -493,7 +493,7 @@ def add_precision_ceilings(parquet_path: str, hidden_queries: list[dict]) -> lis
         assert surviving_groups >= matching_groups, f"{query['id']} reference index must be sound"
         query["max_surviving_row_groups"] = surviving_groups
 
-    return hidden_queries
+    return hidden_queries, len(index_json_bytes(index_payload))
 
 
 def main() -> None:
@@ -528,14 +528,13 @@ def main() -> None:
             writer.close()
 
     visible_queries = build_visible_queries()
-    hidden_queries = add_precision_ceilings(parquet_path, build_hidden_queries())
+    hidden_queries, reference_index_size = add_precision_ceilings(parquet_path, build_hidden_queries())
 
     with open(visible_queries_path, "w", encoding="utf-8") as f:
         json.dump(visible_queries, f, indent=2)
     with open(hidden_queries_path, "w", encoding="utf-8") as f:
         json.dump(hidden_queries, f, indent=2)
 
-    reference_index_size = len(index_json_bytes(build_reference_index(pq.ParquetFile(parquet_path))))
     print(f"Generated {parquet_path} with {ROW_GROUPS} row groups")
     print(f"Reference index size: {reference_index_size} bytes")
 

@@ -1,76 +1,60 @@
-The dataset is at /app/data/sales.parquet. A query specification is at /app/data/queries.json.
+The dataset is at /app/data/sales.parquet. The visible query list is at /app/data/queries.json. The verifier also has a hidden query set that is not present anywhere in the agent image.
 
-The build pass runs before the query pass. The runner hides /app/data/queries.json during the build pass and restores it only after build completes. The build pass may read the parquet file and must write its persisted index to /app/row_group_index.pkl. That index must work for any predicate over the schema without knowing the specific queries in advance.
-
-The query pass runs after the build pass. It reads /app/data/queries.json and /app/row_group_index.pkl. For each query, it reads only the row groups that the index cannot prove are empty, decodes those groups, filters them, and writes the results.
-
-Each query in queries.json has:
-- id
-- predicate tree
-- columns projection
-- max_row_groups_read
-- max_decoded_bytes
-- min_result_count
-
-Predicate nodes: and, or, not, cmp, in, is_null, is_not_null. cmp ops: eq, ne, lt, le, gt, ge.
-
-I need three artifacts:
+I need two artifacts.
 
 1) /app/results.json
 - JSON array
-- exactly one object per query
+- exactly one object per visible query
 - each object must have exactly: query_id (string), rows (array)
 - each row object must have exactly the keys listed in that query's columns field
 - rows must be in sequential row-group scan order
 
-2) /app/trace.jsonl
-- one JSON object per line
-- exactly one line per query
-- lines must follow the same query order as queries.json
-- each line object must have exactly: query_id (string), read_row_groups (array), query_receipt (string), result_count (integer)
+2) /app/row_group_index.json
+- JSON object
+- exact top-level keys: format, parquet_file, row_groups
+- format must be "row-group-index-v1"
+- parquet_file must be "sales.parquet"
+- row_groups must be a JSON array with exactly one entry for each parquet row group, in row-group index order
 
-Each read_row_groups element must have exactly:
+Each row_groups entry must be an object with exactly:
 - row_group (non-negative integer)
-- decoded_rows (integer)
-- decoded_bytes (integer)
-- receipt (string)
+- num_rows (non-negative integer)
+- columns (object)
+- pair_distinct_values (object)
 
-Row groups in each query trace must be strictly increasing by row_group index.
+The columns object must contain exactly one key for every parquet column name. Each value must be an object with exactly:
+- min
+- max
+- null_count
+- distinct_values
+- has_nan
 
-3) /app/row_group_index.pkl
-- persisted build-pass index artifact
-- must be the same index that the query pass loads
-- verifier enforces a size cap on this artifact
+Rules for those column summaries:
+- min and max are either JSON null or canonical scalar values for that column
+- null_count is the exact number of nulls in that row group for that column
+- distinct_values is either JSON null or the exact set of unique non-null values present in that row group for that column, encoded as a JSON array with no duplicates
+- has_nan is true only if that row group contains at least one NaN in that column
 
-Value encoding requirements for both results.json rows and receipt row JSON payloads:
+The pair_distinct_values object maps "left|right" to the exact set of observed row-group value pairs for those two columns. Each value must be a JSON array of two-element JSON arrays [left_value, right_value]. You may include any distinct-column pair keys you want. The verifier only uses facts that are actually present in your index.
+
+Canonical scalar encoding rules for both artifacts:
 - timestamps: ISO 8601 UTC with Z suffix
 - decimals: format(Decimal, "f")
 - regular floats: JSON number
 - NaN: the string "NaN"
 - null: JSON null
 
-Receipt requirements:
-- For each query, define receipt columns as sorted(unique(projection columns union predicate columns)).
-- For each reported row group, decode exactly those receipt columns for every row in that row group.
-- decoded_bytes must equal pyarrow Table.nbytes for that decoded receipt-column table.
-- start blake2b with digest_size=16
-- hash UTF-8 bytes of "rows=N" where N is decoded row count
-- for each decoded row in order, hash JSON(row) with sorted keys and no spaces, then hash a newline byte
-- lowercase hex digest is the receipt
+Each visible query in queries.json has:
+- id
+- predicate tree
+- columns projection
 
-query_receipt format:
-- start blake2b with digest_size=16
-- hash UTF-8 bytes of query_id, then a pipe byte
-- for each read row group in order, hash UTF-8 bytes of "row_group:decoded_rows:decoded_bytes:receipt", then a pipe byte
-- lowercase hex digest is the query_receipt
+Predicate nodes: and, or, not, cmp, in, is_null, is_not_null. cmp ops: eq, ne, lt, le, gt, ge.
 
-result_count must equal the number of rows for that query in results.json.
-Each query must also return at least min_result_count rows.
+The build pass runs before the query pass. The build pass may read /app/data/sales.parquet and must write /app/row_group_index.json. The query pass must load that same persisted index, answer the visible queries from /app/data/queries.json, and write /app/results.json.
 
-Per query, both budgets must hold:
-- len(read_row_groups) <= max_row_groups_read
-- sum(decoded_bytes for read_row_groups) <= max_decoded_bytes
+The verifier checks /app/results.json for exact visible-query correctness. It checks /app/row_group_index.json against hidden queries by using the index to decide which row groups are still possible matches. Any hidden query where your index excludes a row group that really contains a matching row is an immediate failure. Hidden-query precision is graded from how many row groups remain possible after applying your index. There is no self-reported read trace.
 
-Returned rows must exactly match reference predicate evaluation and projection. Every row group that contains at least one matching row must appear in read_row_groups.
+/app/row_group_index.json must be at most 2097152 bytes.
 
 You have 18000 seconds to complete this task. Do not cheat by using online solutions or hints specific to this task.
