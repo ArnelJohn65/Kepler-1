@@ -1,4 +1,4 @@
-A columnar query engine lives in `/app/engine/`. It scans every row group for every query. Your job is to fix a bug and add row-group pruning so it stops doing that.
+A columnar query engine lives in `/app/data/engine.py`. It scans every row group for every query. Your job is to fix a bug and add row-group pruning so it stops doing that.
 
 **The engine**
 
