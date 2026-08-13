@@ -1,0 +1,32 @@
+{
+  "q10_above_all": {
+    "count": 0
+  },
+  "q1_range_narrow": {
+    "count": 478
+  },
+  "q2_boundary_gte_max": {
+    "count": 6643
+  },
+  "q3_boundary_lte_min": {
+    "count": 2383
+  },
+  "q4_is_null": {
+    "count": 498
+  },
+  "q5_is_not_null": {
+    "count": 9502
+  },
+  "q6_range_rg10": {
+    "count": 464
+  },
+  "q7_full_scan": {
+    "count": 10000
+  },
+  "q8_sum_score": {
+    "sum": 23060.8075
+  },
+  "q9_category": {
+    "count": 2549
+  }
+}

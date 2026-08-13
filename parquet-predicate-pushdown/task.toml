@@ -1,0 +1,26 @@
+artifacts = ["/app/results.json", "/app/trace.jsonl"]
+
+[task]
+name = "afterquery/parquet-predicate-pushdown"
+
+[agent]
+timeout_sec = 3600
+
+[verifier]
+environment_mode = "separate"
+timeout_sec = 600
+
+[container]
+gpus = 0
+
+[metadata]
+author_name = "Task Author"
+author_email = "author@example.com"
+category = "Software"
+subcategory = "Databases"
+tags = ["parquet", "query-engine", "predicate-pushdown", "row-groups", "statistics", "bug-fix"]
+difficulty_explanation = "The agent must read unfamiliar engine code, locate a subtle off-by-one bug in per-row-group statistics, fix it, and implement a non-trivial predicate pushdown planner with correct NULL semantics. The verifier requires both correct query answers and measurable pruning evidence, making it impossible to pass by guessing results."
+solution_explanation = "Fix RowGroupStats.update to initialise max_val to value instead of value-1. Implement _can_prune using per-column min/max to prune row groups for range and equality predicates; conservatively keep row groups for IS NULL, IS NOT NULL, NOT, and NEQ. The AND case prunes if any branch prunes; OR only prunes when all branches prune."
+verification_explanation = "pytest checks all 10 query results against ground truth. A separate test sums total row groups read across all trace entries and asserts it is at most 130. A full-scan engine reads 200 (20 row groups × 10 queries), so 130 is unreachable without genuine pushdown. Boundary predicate tests (q2, q3) fail if the off-by-one bug is not fixed."
+expert_time_estimate_hours = 2
+relevant_experience = "The author has experience building columnar storage engines and query optimisers, including implementing row-group pruning for Parquet readers in production data warehouse systems."
