@@ -1,12 +1,3 @@
-"""
-Baseline engine scaffold with two-pass execution.
-
-build: may scan all row groups and persist any index files.
-query: must load persisted index and produce /app/results.json and /app/trace.jsonl.
-
-This baseline intentionally does no pruning in query mode.
-"""
-
 import hashlib
 import json
 import math
@@ -25,7 +16,7 @@ APP_ROOT = os.environ.get("APP_ROOT", "/app")
 DATA_DIR = os.path.join(APP_ROOT, "data")
 RESULTS_PATH = os.path.join(APP_ROOT, "results.json")
 TRACE_PATH = os.path.join(APP_ROOT, "trace.jsonl")
-INDEX_PATH = os.path.join(DATA_DIR, "row_group_index.pkl")
+INDEX_PATH = os.path.join(DATA_DIR, "exact_read_index.pkl")
 
 
 def _normalize(v: Any) -> Any:
@@ -46,39 +37,35 @@ def _coerce_scalar(value: Any, dtype: pa.DataType) -> Any:
     return value
 
 
-def _load_queries() -> list[dict[str, Any]]:
-    with open(os.path.join(DATA_DIR, "queries.json"), encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _columns_in_predicate(node: dict[str, Any] | None, out: set[str]) -> None:
+def _columns_in_predicate(node: dict[str, Any] | None, output: set[str]) -> None:
     if node is None:
         return
     t = node["type"]
     if t in {"cmp", "in", "is_null", "is_not_null"}:
-        out.add(node["column"])
-    elif t in {"and", "or"}:
+        output.add(node["column"])
+        return
+    if t in {"and", "or"}:
         for c in node["children"]:
-            _columns_in_predicate(c, out)
-    elif t == "not":
-        _columns_in_predicate(node["child"], out)
+            _columns_in_predicate(c, output)
+        return
+    if t == "not":
+        _columns_in_predicate(node["child"], output)
 
 
-def _build_mask(table: pa.Table, node: dict[str, Any]) -> pa.Array:
+def _mask(table: pa.Table, node: dict[str, Any]) -> pa.Array:
     t = node["type"]
     if t == "cmp":
         col = table.column(node["column"])
         op = node["op"]
         val = _coerce_scalar(node["value"], col.type)
-        ops = {
+        return {
             "eq": pc.equal,
             "ne": pc.not_equal,
             "lt": pc.less,
             "le": pc.less_equal,
             "gt": pc.greater,
             "ge": pc.greater_equal,
-        }
-        return ops[op](col, val)
+        }[op](col, val)
     if t == "in":
         col = table.column(node["column"])
         values = [_coerce_scalar(v, col.type) for v in node["values"]]
@@ -88,26 +75,26 @@ def _build_mask(table: pa.Table, node: dict[str, Any]) -> pa.Array:
     if t == "is_not_null":
         return pc.is_valid(table.column(node["column"]))
     if t == "and":
-        masks = [_build_mask(table, c) for c in node["children"]]
-        out = masks[0]
-        for m in masks[1:]:
-            out = pc.and_(out, m)
+        parts = [_mask(table, c) for c in node["children"]]
+        out = parts[0]
+        for p in parts[1:]:
+            out = pc.and_(out, p)
         return out
     if t == "or":
-        masks = [_build_mask(table, c) for c in node["children"]]
-        out = masks[0]
-        for m in masks[1:]:
-            out = pc.or_(out, m)
+        parts = [_mask(table, c) for c in node["children"]]
+        out = parts[0]
+        for p in parts[1:]:
+            out = pc.or_(out, p)
         return out
     if t == "not":
-        return pc.invert(_build_mask(table, node["child"]))
-    raise ValueError(f"unknown predicate type: {t}")
+        return pc.invert(_mask(table, node["child"]))
+    raise ValueError(t)
 
 
-def _apply_predicate(table: pa.Table, predicate: dict[str, Any] | None) -> pa.Table:
+def _apply(table: pa.Table, predicate: dict[str, Any] | None) -> pa.Table:
     if predicate is None:
         return table
-    return table.filter(_build_mask(table, predicate))
+    return table.filter(_mask(table, predicate))
 
 
 def _receipt(table: pa.Table) -> str:
@@ -130,36 +117,16 @@ def _query_receipt(query_id: str, read_row_groups: list[dict[str, Any]]) -> str:
     return h.hexdigest()
 
 
-def build_index() -> None:
+def _load_queries() -> list[dict[str, Any]]:
+    with open(os.path.join(DATA_DIR, "queries.json"), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def build() -> None:
     queries = _load_queries()
-    if not queries:
-        raise RuntimeError("No queries available")
     pf = pq.ParquetFile(os.path.join(DATA_DIR, queries[0]["file"]))
 
-    # Baseline placeholder index: only row counts and stat presence.
-    stats = []
-    for rg_idx in range(pf.metadata.num_row_groups):
-        rg = pf.metadata.row_group(rg_idx)
-        stats.append({"row_group": rg_idx, "num_rows": rg.num_rows, "num_columns": rg.num_columns})
-
-    with open(INDEX_PATH, "wb") as f:
-        pickle.dump({"row_groups": stats}, f)
-
-    print(f"Wrote {INDEX_PATH}")
-
-
-def run_queries() -> None:
-    if not os.path.exists(INDEX_PATH):
-        raise RuntimeError(f"Missing build-pass index: {INDEX_PATH}")
-
-    queries = _load_queries()
-    if not queries:
-        raise RuntimeError("No queries available")
-    pf = pq.ParquetFile(os.path.join(DATA_DIR, queries[0]["file"]))
-
-    all_results: list[dict[str, Any]] = []
-    all_traces: list[dict[str, Any]] = []
-
+    read_plan: dict[str, dict[str, Any]] = {}
     for q in queries:
         predicate = q.get("predicate")
         proj = q["columns"]
@@ -167,13 +134,38 @@ def run_queries() -> None:
         _columns_in_predicate(predicate, required)
         read_cols = sorted(required)
 
-        rows = []
-        read_trace = []
+        matching_groups: list[int] = []
         for rg in range(pf.metadata.num_row_groups):
             decoded = pf.read_row_group(rg, columns=read_cols)
-            filtered = _apply_predicate(decoded, predicate)
-            rows.extend({k: _normalize(v) for k, v in row.items()} for row in filtered.select(proj).to_pylist())
+            if _apply(decoded, predicate).num_rows > 0:
+                matching_groups.append(rg)
 
+        read_plan[q["id"]] = {"read_columns": read_cols, "matching_groups": matching_groups}
+
+    with open(INDEX_PATH, "wb") as f:
+        pickle.dump(read_plan, f)
+
+
+def query() -> None:
+    queries = _load_queries()
+    pf = pq.ParquetFile(os.path.join(DATA_DIR, queries[0]["file"]))
+    with open(INDEX_PATH, "rb") as f:
+        read_plan = pickle.load(f)
+
+    all_results = []
+    all_traces = []
+    for q in queries:
+        predicate = q.get("predicate")
+        proj = q["columns"]
+        plan = read_plan[q["id"]]
+        read_cols = plan["read_columns"]
+
+        rows = []
+        read_trace = []
+        for rg in plan["matching_groups"]:
+            decoded = pf.read_row_group(rg, columns=read_cols)
+            filtered = _apply(decoded, predicate)
+            rows.extend({k: _normalize(v) for k, v in row.items()} for row in filtered.select(proj).to_pylist())
             read_trace.append(
                 {
                     "row_group": rg,
@@ -199,20 +191,18 @@ def run_queries() -> None:
         for rec in all_traces:
             f.write(json.dumps(rec) + "\n")
 
-    print(f"Wrote {RESULTS_PATH} and {TRACE_PATH}")
-
 
 def main() -> None:
-    mode = sys.argv[1] if len(sys.argv) > 1 else "query"
+    mode = sys.argv[1] if len(sys.argv) > 1 else "all"
     if mode == "build":
-        build_index()
+        build()
     elif mode == "query":
-        run_queries()
+        query()
     elif mode == "all":
-        build_index()
-        run_queries()
+        build()
+        query()
     else:
-        raise SystemExit("Usage: python engine.py [build|query|all]")
+        raise SystemExit("Usage: python exact_pruner.py [build|query|all]")
 
 
 if __name__ == "__main__":

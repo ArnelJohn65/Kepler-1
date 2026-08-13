@@ -145,11 +145,12 @@ def trace_by_id(
         last_rg = -1
         for entry in read_row_groups:
             assert isinstance(entry, dict), f"trace read row group entry for {query_id} must be an object"
-            assert set(entry.keys()) == {"row_group", "decoded_rows", "receipt"}, (
-                f"read_row_groups entry keys for {query_id} must be exactly row_group, decoded_rows, receipt"
+            assert set(entry.keys()) == {"row_group", "decoded_rows", "decoded_bytes", "receipt"}, (
+                f"read_row_groups entry keys for {query_id} must be exactly row_group, decoded_rows, decoded_bytes, receipt"
             )
             rg = entry["row_group"]
             decoded_rows = entry["decoded_rows"]
+            decoded_bytes = entry["decoded_bytes"]
             receipt = entry["receipt"]
             assert isinstance(rg, int) and not isinstance(rg, bool) and rg >= 0, (
                 f"row_group must be a non-negative integer for {query_id}"
@@ -157,6 +158,9 @@ def trace_by_id(
             assert rg > last_rg, f"row_group entries must be strictly increasing for {query_id}"
             assert isinstance(decoded_rows, int) and not isinstance(decoded_rows, bool) and decoded_rows >= 0, (
                 f"decoded_rows must be a non-negative integer for {query_id}"
+            )
+            assert isinstance(decoded_bytes, int) and not isinstance(decoded_bytes, bool) and decoded_bytes >= 0, (
+                f"decoded_bytes must be a non-negative integer for {query_id}"
             )
             assert isinstance(receipt, str) and len(receipt) == 32, f"invalid receipt format for {query_id} rg {rg}"
             last_rg = rg
@@ -262,6 +266,18 @@ def test_query_pruning_targets(
     assert len(reads) <= max_reads, f"{query_id} read {len(reads)} row groups but max is {max_reads}"
 
 
+def test_query_budget_shape(queries: list[dict[str, Any]], parquet_file: pq.ParquetFile) -> None:
+    total_groups = parquet_file.metadata.num_row_groups
+    for query in queries:
+        max_reads = int(query["max_row_groups_read"])
+        assert max_reads < total_groups, f"{query['id']} must allow pruning opportunity (max_row_groups_read < total groups)"
+        assert max_reads <= max(1, total_groups // 5), (
+            f"{query['id']} max_row_groups_read is too loose for anti-cheat robustness"
+        )
+        max_bytes = int(query["max_decoded_bytes"])
+        assert max_bytes > 0, f"{query['id']} max_decoded_bytes must be positive"
+
+
 def test_trace_receipts_match_decoded_bytes(
     query_id: str,
     queries_by_id: dict[str, dict[str, Any]],
@@ -280,12 +296,20 @@ def test_trace_receipts_match_decoded_bytes(
     record = trace_by_id[query_id]
     reads = record["read_row_groups"]
 
+    total_decoded_bytes = 0
     for entry in reads:
         rg = entry["row_group"]
         assert rg < parquet_file.metadata.num_row_groups, f"row_group {rg} out of range for {query_id}"
         decoded = parquet_file.read_row_group(rg, columns=read_columns)
         assert entry["decoded_rows"] == decoded.num_rows, f"decoded_rows mismatch for {query_id} rg {rg}"
+        assert entry["decoded_bytes"] == decoded.nbytes, f"decoded_bytes mismatch for {query_id} rg {rg}"
         assert entry["receipt"] == receipt_for_table(decoded), f"receipt mismatch for {query_id} rg {rg}"
+        total_decoded_bytes += decoded.nbytes
+
+    max_decoded_bytes = int(query["max_decoded_bytes"])
+    assert total_decoded_bytes <= max_decoded_bytes, (
+        f"{query_id} decoded {total_decoded_bytes} bytes in query phase but max is {max_decoded_bytes}"
+    )
 
     expected_query_receipt = query_receipt(query_id, reads)
     assert record["query_receipt"] == expected_query_receipt, f"query_receipt mismatch for {query_id}"

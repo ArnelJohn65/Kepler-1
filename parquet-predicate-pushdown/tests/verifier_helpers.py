@@ -117,7 +117,9 @@ def query_receipt(query_id: str, read_row_groups: list[dict[str, Any]]) -> str:
     h.update(query_id.encode("utf-8"))
     h.update(b"|")
     for entry in read_row_groups:
-        h.update(f"{entry['row_group']}:{entry['decoded_rows']}:{entry['receipt']}".encode("utf-8"))
+        h.update(
+            f"{entry['row_group']}:{entry['decoded_rows']}:{entry['decoded_bytes']}:{entry['receipt']}".encode("utf-8")
+        )
         h.update(b"|")
     return h.hexdigest()
 
