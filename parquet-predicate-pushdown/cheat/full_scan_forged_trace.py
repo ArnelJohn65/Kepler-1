@@ -1,5 +1,8 @@
 import json
+import math
 import os
+from datetime import UTC, datetime
+from decimal import Decimal
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -9,6 +12,24 @@ APP_ROOT = os.environ.get("APP_ROOT", "/app")
 DATA_DIR = os.path.join(APP_ROOT, "data")
 RESULTS_PATH = os.path.join(APP_ROOT, "results.json")
 TRACE_PATH = os.path.join(APP_ROOT, "trace.jsonl")
+
+
+def _normalize(v):
+    if isinstance(v, float) and math.isnan(v):
+        return "NaN"
+    if isinstance(v, Decimal):
+        return format(v, "f")
+    if isinstance(v, datetime):
+        return v.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    return v
+
+
+def _coerce_scalar(value, dtype):
+    if pa.types.is_decimal(dtype):
+        return Decimal(str(value))
+    if pa.types.is_timestamp(dtype) and isinstance(value, str):
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return value
 
 
 def _columns_in_predicate(node, output):
@@ -32,7 +53,7 @@ def _mask(table: pa.Table, node):
     if t == "cmp":
         col = table.column(node["column"])
         op = node["op"]
-        val = node["value"]
+        val = _coerce_scalar(node["value"], col.type)
         return {
             "eq": pc.equal,
             "ne": pc.not_equal,
@@ -43,7 +64,8 @@ def _mask(table: pa.Table, node):
         }[op](col, val)
     if t == "in":
         col = table.column(node["column"])
-        return pc.is_in(col, value_set=pa.array(node["values"], type=col.type))
+        vals = [_coerce_scalar(v, col.type) for v in node["values"]]
+        return pc.is_in(col, value_set=pa.array(vals, type=col.type))
     if t == "is_null":
         return pc.is_null(table.column(node["column"]))
     if t == "is_not_null":
@@ -88,13 +110,12 @@ def main():
         for rg in range(pf.metadata.num_row_groups):
             decoded = pf.read_row_group(rg, columns=read_cols)
             filtered = _apply(decoded, predicate)
-            rows.extend(filtered.select(proj).to_pylist())
+            rows.extend({k: _normalize(v) for k, v in row.items()} for row in filtered.select(proj).to_pylist())
         all_results.append({"query_id": q["id"], "rows": rows})
 
     with open(RESULTS_PATH, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2)
 
-    # Forged trace that claims selective reads without valid receipts.
     with open(TRACE_PATH, "w", encoding="utf-8") as f:
         for q in queries:
             fake = {
