@@ -14,6 +14,8 @@ You need to:
 
 import json
 import os
+from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 import pyarrow as pa
@@ -30,12 +32,20 @@ def _load_queries() -> list[dict[str, Any]]:
         return json.load(f)
 
 
+def _coerce_scalar(value: Any, dtype: pa.DataType) -> Any:
+    if pa.types.is_decimal(dtype):
+        return Decimal(str(value))
+    if pa.types.is_timestamp(dtype) and isinstance(value, str):
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return value
+
+
 def _build_mask(table: pa.Table, node: dict[str, Any]) -> pa.Array:
     t = node["type"]
     if t == "cmp":
         col = table.column(node["column"])
         op = node["op"]
-        val = node["value"]
+        val = _coerce_scalar(node["value"], col.type)
         ops = {
             "eq": pc.equal, "ne": pc.not_equal,
             "lt": pc.less, "le": pc.less_equal,
@@ -44,7 +54,8 @@ def _build_mask(table: pa.Table, node: dict[str, Any]) -> pa.Array:
         return ops[op](col, val)
     if t == "in":
         col = table.column(node["column"])
-        return pc.is_in(col, value_set=pa.array(node["values"], type=col.type))
+        values = [_coerce_scalar(v, col.type) for v in node["values"]]
+        return pc.is_in(col, value_set=pa.array(values, type=col.type))
     if t == "is_null":
         return pc.is_null(table.column(node["column"]))
     if t == "is_not_null":
