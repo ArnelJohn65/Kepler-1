@@ -36,15 +36,31 @@ def _normalize(v: Any) -> Any:
     return v
 
 
+_INDEX_VALUE_SET_COLUMNS = ["region", "segment", "status", "sku", "event_day"]
+_INDEX_NULLABLE_COLUMNS = ["priority", "score"]
+
+
 def _load_queries() -> list[dict[str, Any]]:
     with open(os.path.join(DATA_DIR, "queries.json"), encoding="utf-8") as f:
         return json.load(f)
 
 
-def _load_index() -> dict[int, dict[str, Any]]:
-    with open(os.path.join(DATA_DIR, "row_group_index.json"), encoding="utf-8") as f:
-        entries = json.load(f)
-    return {int(entry["row_group"]): entry for entry in entries}
+def _build_index_from_parquet(pf: pq.ParquetFile) -> dict[int, dict[str, Any]]:
+    index: dict[int, dict[str, Any]] = {}
+    columns_to_read = _INDEX_VALUE_SET_COLUMNS + _INDEX_NULLABLE_COLUMNS
+    for rg_idx in range(pf.metadata.num_row_groups):
+        table = pf.read_row_group(rg_idx, columns=columns_to_read)
+        values: dict[str, list[Any]] = {}
+        for col_name in _INDEX_VALUE_SET_COLUMNS:
+            col = table.column(col_name)
+            non_null = col.drop_null()
+            values[col_name] = sorted(set(non_null.to_pylist()))
+        has_null: dict[str, bool] = {}
+        for col_name in _INDEX_NULLABLE_COLUMNS:
+            col = table.column(col_name)
+            has_null[col_name] = col.null_count > 0
+        index[rg_idx] = {"values": values, "has_null": has_null}
+    return index
 
 
 def _extract_stats(rg_meta: pq.RowGroupMetaData) -> dict[str, ColumnStats]:
@@ -315,11 +331,11 @@ def _query_receipt(query_id: str, read_row_groups: list[dict[str, Any]]) -> str:
 
 def main() -> None:
     queries = _load_queries()
-    index_by_rg = _load_index()
     if not queries:
         raise RuntimeError("No queries available")
 
     pf = pq.ParquetFile(os.path.join(DATA_DIR, queries[0]["file"]))
+    index_by_rg = _build_index_from_parquet(pf)
 
     results_payload: list[dict[str, Any]] = []
     trace_records: list[dict[str, Any]] = []

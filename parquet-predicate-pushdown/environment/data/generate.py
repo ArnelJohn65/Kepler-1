@@ -272,29 +272,40 @@ def build_queries() -> list[dict]:
             "max_row_groups_read": 4,
             "min_result_count": 1,
         },
+        {
+            "id": "q9",
+            "file": "sales.parquet",
+            "columns": ["id", "segment", "status", "priority", "amount"],
+            "predicate": {
+                "type": "and",
+                "children": [
+                    {"type": "cmp", "column": "segment", "op": "eq", "value": "startup"},
+                    {"type": "cmp", "column": "status", "op": "eq", "value": "pending"},
+                    {"type": "is_null", "column": "priority"},
+                    {"type": "cmp", "column": "amount", "op": "ge", "value": 200.0},
+                    {"type": "cmp", "column": "amount", "op": "lt", "value": 300.0},
+                ],
+            },
+            "max_row_groups_read": 3,
+            "min_result_count": 1,
+        },
     ]
 
 
 def main() -> None:
     parquet_path = os.path.join(OUT_DIR, "sales.parquet")
-    index_path = os.path.join(OUT_DIR, "row_group_index.json")
     queries_path = os.path.join(OUT_DIR, "queries.json")
 
     writer = None
-    index_entries = []
     try:
         for rg in range(ROW_GROUPS):
-            table, entry = make_row_group(rg)
-            index_entries.append(entry)
+            table, _entry = make_row_group(rg)
             if writer is None:
                 writer = pq.ParquetWriter(parquet_path, table.schema, write_statistics=True)
             writer.write_table(table)
     finally:
         if writer is not None:
             writer.close()
-
-    with open(index_path, "w", encoding="utf-8") as f:
-        json.dump(index_entries, f, indent=2)
 
     queries = build_queries()
     with open(queries_path, "w", encoding="utf-8") as f:
