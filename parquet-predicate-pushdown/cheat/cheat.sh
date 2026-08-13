@@ -2,7 +2,7 @@
 # Plausible cheating attempt: write fabricated results and a fake trace.
 #
 # Why the verifier rejects this:
-#   1. The result counts (e.g. q1: 50 rows) happen to be right, but the actual
+#   1. The result counts (e.g. q1: 1 row, q2: 1000 rows) can be guessed, but the actual
 #      row data (id, sensor_id values) must match the ground truth exactly.
 #      A cheat that doesn't run the engine cannot know the correct id values
 #      without running the generator with the exact same seed.
@@ -12,9 +12,9 @@
 #      that doesn't understand this will produce the wrong segment lengths,
 #      causing _count_reads_by_query to misattribute events to wrong queries
 #      and fail the per-query threshold assertions.
-#   3. test_q5_boundary_correct checks that sensor_id=200 returns 50 rows with
-#      the correct id values. Getting these right without running the engine
-#      requires exact knowledge of the deterministic generator output.
+#   3. test_q5_boundary_correct checks that sensor_id=10000 returns exactly 1 row
+#      with the correct id and sensor_id. Getting this right without running the
+#      engine requires exact knowledge of the deterministic generator output.
 #
 # A determined cheater who reads the ground_truth.json from the tests image
 # still cannot access it at solve time — it is in a separate sealed image.
