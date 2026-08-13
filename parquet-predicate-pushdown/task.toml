@@ -1,11 +1,12 @@
+schema_version = "1.0"
 artifacts = ["/app/results.json", "/app/trace.jsonl"]
-gpus = 0
 
 [task]
 name = "afterquery/parquet-predicate-pushdown"
 version = "1.0.0"
-category = "Software"
-labels = ["query-engine", "parquet", "columnar", "predicate-pushdown", "python"]
+
+[environment]
+gpus = 0
 
 [agent]
 timeout_sec = 14400
@@ -17,11 +18,10 @@ environment_mode = "separate"
 author_name = "Arnel John Mengote"
 author_email = "arneljohn65@outlook.com"
 relevant_experience = "I've spent 13 years building and debugging data pipelines across Redshift, BigQuery, Snowflake, Spark, and Databricks, which means I've read a lot of query plans and chased a lot of wrong-results bugs. At Qantas I migrated airline booking, fare, CRM and operational datasets from Redshift to BigQuery with parallel-run validation, so I know what it takes to prove that a rewritten engine returns identical numbers. At Insurity and UHS I built dbt star schemas and SCD2 marts on Snowflake and Databricks where null handling and boundary conditions in predicate pushdown were the exact class of bugs that caused silent data loss. That background makes it straightforward for me to judge whether a row-group pruning implementation is actually correct or just passes easy cases."
-task_explanation = "The task requires candidates to implement predicate pushdown and row-group pruning in a small query engine. The engine is intentionally broken: it reads every row group regardless of predicates, and the min/max statistics writer has an off-by-one bug on boundary values. Candidates must fix the statistics bug and implement pruning in the planner, while handling nulls correctly so that IS NULL and negated predicates are not incorrectly pruned."
-difficulty_explanation = "This task is hard because the failure mode is quietly wrong answers. You have to catch a boundary-condition stats bug, reason about null semantics where nulls are excluded from min and max stats, and still deliver both correct query results and real pruning evidence in the execution trace."
-solution_explanation = "Fix the off-by-one bug in the min and max stats writer. Then add planner row-group pruning that is keyed on those stats. Handle IS NULL and negated predicates separately because nulls are excluded from stats and can invalidate naive pruning. Finally, emit a real read trace that reports the row groups actually read per query."
-verification_explanation = "The verifier runs a hidden query suite and compares all outputs to ground truth for correctness. It also checks the trace and requires total row groups read to stay below a threshold that is only reachable when pruning is genuinely happening."
+difficulty_explanation = "This task combines correctness and optimizer work under strict trace validation. The predicates are nested boolean trees with AND/OR/NOT, IN lists, and null checks. Row-group pruning requires combining Parquet min/max statistics with a persisted per-row-group value index, while keeping SQL null semantics correct. The dataset is synthetic but seeded and large enough to have many row groups, so weak pruning strategies miss verifier targets. For a human expert, most time goes to designing safe prune rules for nested predicates and validating edge cases. For an agent, the hard part is implementing the tree evaluator, the pruning planner, and deterministic trace receipts without over-pruning. This is the kind of work done by database engine, storage, and query performance engineers."
+solution_explanation = "The solution runs a standalone Python program from solution/solve.py. It loads queries, reads Parquet row-group metadata, loads the persisted row-group value index, evaluates predicates with full SQL-like null behavior, and prunes row groups only when a match is impossible. For each read row group it computes a deterministic receipt from decoded values and emits one structured trace record per query. It then writes full query outputs to /app/results.json and trace records to /app/trace.jsonl."
+verification_explanation = "The verifier is a pytest suite. It first validates results.json and trace.jsonl against the required schemas. It computes reference results by full scanning the dataset with an internal reference evaluator, then compares every query row set and exact row count. It verifies trace receipts per query and per row group by recomputing decoded-row checksums from the underlying Parquet bytes and checking query-level receipt chains. It also checks per-query pruning requirements declared in /app/data/queries.json (max_row_groups_read) and rejects traces that exceed them. A bundled cheat script demonstrates that full-scan output plus forged trace is rejected."
 category = "Software"
 subcategory = "Databases"
-tags = ["databases", "query-optimization", "python"]
-expert_time_estimate_hours = 6
+tags = ["databases", "query-optimization", "python", "parquet", "storage-engines"]
+expert_time_estimate_hours = 14
